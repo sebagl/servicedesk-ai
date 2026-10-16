@@ -1,20 +1,35 @@
 export { Counter } from "./counter";
+export { DayAgenda } from "./agenda-actor";
 import type { Counter } from "./counter";
+import type { DayAgenda } from "./agenda-actor";
 
 import {
   type ActorNamespace,
   type ActorStub,
   type IdFromNameOptions,
   type Secrets,
+  type KvNamespace,
 } from "@telnyx/edge-runtime";
+
+import { loadConfig, type AppConfig } from "./config";
+import { getAvailability, validateDateParam } from "./availability";
+import { handleBookingRequest } from "./bookings";
 
 type CounterStub = ActorStub & Pick<Counter, "increment" | "read">;
 interface CounterNamespace extends ActorNamespace {
   idFromName(name: string, options?: IdFromNameOptions): CounterStub;
 }
+
+type AgendaStub = ActorStub & Pick<DayAgenda, "getOccupiedSlots" | "createBooking">;
+interface AgendaNamespace extends ActorNamespace {
+  idFromName(name: string, options?: IdFromNameOptions): AgendaStub;
+}
+
 interface Env {
   COUNTER: CounterNamespace;
+  AGENDA: AgendaNamespace;
   SECRETS?: Secrets;
+  CONFIG?: KvNamespace;
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -52,11 +67,19 @@ export default {
     if (url.pathname === "/health/liveness") return new Response("ok");
     if (url.pathname === "/health/readiness") return new Response("ok");
 
-    // SMOKE-TEST ONLY — protected by SMOKE_TEST_TOKEN secret.
-    // Remove before public deployment.
-    const m = url.pathname.match(/^\/demo\/counter\/([^/]+)\/(increment|read)$/);
-    if (!m) return new Response("not found", { status: 404 });
+    // --- Demo routes (smoke-test only, auth-gated) ---
+    const isDemoConfig = url.pathname === "/demo/config";
+    const isDemoAvailability = url.pathname === "/demo/availability";
+    const isDemoBookings = url.pathname === "/demo/bookings";
+    const counterMatch = url.pathname.match(
+      /^\/demo\/counter\/([^/]+)\/(increment|read)$/,
+    );
 
+    if (!isDemoConfig && !isDemoAvailability && !isDemoBookings && !counterMatch) {
+      return new Response("not found", { status: 404 });
+    }
+
+    // Authenticate before reading KV or reaching the Actor.
     const token = await getSmokeToken(env);
     if (token === null) {
       return Response.json({ error: "service_unavailable" }, { status: 503 });
@@ -67,8 +90,72 @@ export default {
       return Response.json({ error: "unauthorized" }, { status: 401 });
     }
 
-    const id = m[1]!;
-    const action = m[2]!;
+    // --- GET /demo/config ---
+    if (isDemoConfig) {
+      if (req.method !== "GET") {
+        return new Response("not found", { status: 404 });
+      }
+      if (!env.CONFIG) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+      const result = await loadConfig(env.CONFIG);
+      if (!result.ok) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+      return Response.json(result.config satisfies AppConfig);
+    }
+
+    // --- GET /demo/availability?date=YYYY-MM-DD ---
+    if (isDemoAvailability) {
+      if (req.method !== "GET") {
+        return new Response("not found", { status: 404 });
+      }
+      if (!env.CONFIG || !env.AGENDA) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+      const dateOrError = validateDateParam(url.searchParams);
+      if (typeof dateOrError !== "string") {
+        const status = dateOrError.kind === "date_out_of_range" ? 400 : 400;
+        return Response.json(
+          { error: dateOrError.kind },
+          { status },
+        );
+      }
+
+      const cfgResult = await loadConfig(env.CONFIG);
+      if (!cfgResult.ok) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+
+      const result = await getAvailability(
+        dateOrError,
+        Date.now(),
+        cfgResult.config,
+        env.AGENDA,
+      );
+
+      if ("kind" in result) {
+        if (result.kind === "date_out_of_range") {
+          return Response.json({ error: "date_out_of_range" }, { status: 400 });
+        }
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+
+      return Response.json(result);
+    }
+
+    // --- POST /demo/bookings ---
+    if (isDemoBookings) {
+      if (req.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      const result = await handleBookingRequest(req, env);
+      return Response.json(result.body, { status: result.status });
+    }
+
+    // --- /demo/counter/:id/{increment,read} ---
+    const id = counterMatch![1]!;
+    const action = counterMatch![2]!;
     const stub = env.COUNTER.idFromName(id);
 
     if (action === "increment" && req.method === "POST") {

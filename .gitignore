@@ -17,5 +17,9 @@ dist/
 *.log
 *.log.*
 
-# OpenCode session/history files
-.opencode/
+# OpenCode — track config files, ignore dependencies and package artifacts
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+.opencode/.gitignore

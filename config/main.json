@@ -1,0 +1,15 @@
+{
+  "services": [
+    { "id": "oil_change", "name": "Oil Change", "duration_minutes": 60 },
+    { "id": "tire_rotation", "name": "Tire Rotation", "duration_minutes": 60 },
+    { "id": "general_maintenance", "name": "General Maintenance Service", "duration_minutes": 60 }
+  ],
+  "business": {
+    "location_id": "main",
+    "timezone": "America/Mexico_City",
+    "open_days": ["mon", "tue", "wed", "thu", "fri"],
+    "slot_hours": { "start": "09:00", "end": "17:00", "last_start": "16:00" },
+    "booking_window_days": 7,
+    "booking_enabled": true
+  }
+}

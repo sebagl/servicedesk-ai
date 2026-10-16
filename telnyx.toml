@@ -12,6 +12,18 @@ compatibility_date = "2026-05-01"
 binding = "COUNTER"
 type    = "Counter"
 
+# Agenda Actor — one instance per location/day (e.g. main-2026-10-20).
+# Owns authoritative occupancy for that date.
+[[actors]]
+binding = "AGENDA"
+type    = "DayAgenda"
+
+# KV namespace for service catalog + business configuration.
+# Created via `telnyx-edge storage kv create --name servicedesk-ai-config`.
+# Not available in local `dev` — config loader fails closed (503) without it.
+[storage.kv.CONFIG]
+id = "533e7681-de0d-4af6-bf4d-1da671f7f5d3"
+
 # Smoke-test authentication secret for /demo/counter/* routes.
 # Set independently of TELNYX_API_KEY: `telnyx-edge secrets add SMOKE_TEST_TOKEN <value>`.
 # Local `dev` does not emulate secrets — demo routes fail closed (503) without it.
