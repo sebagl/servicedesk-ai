@@ -1,0 +1,26 @@
+# Telnyx Edge Compute — umbrella manifest (telnyx.toml).
+# Exports a `fetch` handler + StatefulActor classes; the runtime serves it.
+# Distinct from func.toml (which runs its own node:http server). Do not mix.
+# Source: https://developers.telnyx.com/docs/edge-compute/stateful-actors/guides/project-structure
+
+name = "servicedesk-ai"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+
+# Demo actor — platform-compatibility probe, NOT the booking actor.
+[[actors]]
+binding = "COUNTER"
+type    = "Counter"
+
+# Smoke-test authentication secret for /demo/counter/* routes.
+# Set independently of TELNYX_API_KEY: `telnyx-edge secrets add SMOKE_TEST_TOKEN <value>`.
+# Local `dev` does not emulate secrets — demo routes fail closed (503) without it.
+[[secrets]]
+binding = "SMOKE_AUTH"
+name    = "SMOKE_TEST_TOKEN"
+
+# Registered via `telnyx-edge new-func --actor` (2026-10-16).
+# Required for `ship`; `dev` and `types` do not need it.
+[edge_compute]
+func_id   = "a666861a-13f6-4dd3-8955-8201bee7209c"
+func_name = "servicedesk-ai"

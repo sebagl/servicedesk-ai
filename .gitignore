@@ -1,0 +1,21 @@
+# Secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Telnyx Edge local dev/runtime artifacts (written by `telnyx-edge dev`)
+.telnyx/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+*.log.*
+
+# OpenCode session/history files
+.opencode/
