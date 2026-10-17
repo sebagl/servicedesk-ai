@@ -258,7 +258,10 @@ describe("/mcp — tools/list", () => {
     const body = (await listRes.json()) as {
       result: { tools: Array<{ name: string }> };
     };
-    expect(body.result.tools.map((t) => t.name)).toEqual(["get_service_catalog"]);
+    expect(body.result.tools.map((t) => t.name)).toEqual([
+      "get_service_catalog",
+      "get_availability",
+    ]);
   });
 });
 
@@ -501,5 +504,232 @@ describe("/mcp — two independent requests have no shared transport state", () 
       env as never,
     );
     expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tools/call — get_availability
+// ---------------------------------------------------------------------------
+
+describe("/mcp — tools/call get_availability", () => {
+  // Pick a date within the 7-day booking window that lands on an open
+  // weekday (Mon–Fri in America/Mexico_City), so generateDaySlots returns
+  // the full 8-slot set deterministically.
+  function futureOpenDate(): string {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Mexico_City",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+    });
+    for (let i = 1; i <= 6; i++) {
+      const parts = fmt.formatToParts(new Date(Date.now() + i * 86_400_000));
+      const weekday = parts.find((p) => p.type === "weekday")!.value;
+      if (["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday)) {
+        const y = parts.find((p) => p.type === "year")!.value;
+        const m = parts.find((p) => p.type === "month")!.value;
+        const d = parts.find((p) => p.type === "day")!.value;
+        return `${y}-${m}-${d}`;
+      }
+    }
+    throw new Error("no open weekday within booking window");
+  }
+
+  function validAgenda(occupied: string[] = []) {
+    return {
+      idFromName: vi.fn(() => ({
+        getOccupiedSlots: vi.fn(async () => ({ occupied })),
+      })),
+    };
+  }
+
+  function throwingAgenda() {
+    return {
+      idFromName: vi.fn(() => ({
+        getOccupiedSlots: vi.fn(async () => {
+          throw new Error("actor down");
+        }),
+      })),
+    };
+  }
+
+  it("returns available_times for an open date with no occupancy", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = validAgenda();
+    const date = futureOpenDate();
+    const res = await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_availability",
+          arguments: { date },
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError?: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content).toHaveLength(1);
+    const parsed = JSON.parse(body.result.content[0]!.text) as {
+      date: string;
+      timezone: string;
+      booking_enabled: boolean;
+      available_times: string[];
+    };
+    expect(parsed.date).toBe(date);
+    expect(parsed.timezone).toBe("America/Mexico_City");
+    expect(parsed.booking_enabled).toBe(true);
+    expect(parsed.available_times).toEqual([
+      "09:00",
+      "10:00",
+      "11:00",
+      "12:00",
+      "13:00",
+      "14:00",
+      "15:00",
+      "16:00",
+    ]);
+    expect(agenda.idFromName).toHaveBeenCalledTimes(1);
+  });
+
+  it("excludes occupied slots from available_times", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = validAgenda(["10:00", "14:00"]);
+    const date = futureOpenDate();
+    const res = await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_availability",
+          arguments: { date },
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError?: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBeFalsy();
+    const parsed = JSON.parse(body.result.content[0]!.text) as {
+      available_times: string[];
+    };
+    expect(parsed.available_times).not.toContain("10:00");
+    expect(parsed.available_times).not.toContain("14:00");
+    expect(parsed.available_times).toContain("09:00");
+    expect(parsed.available_times).toContain("16:00");
+  });
+
+  it("out-of-range date → date_out_of_range isError", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = validAgenda();
+    const res = await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_availability",
+          arguments: { date: "2099-01-01" },
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "date_out_of_range" }),
+    );
+  });
+
+  it("calendar-invalid date → date_invalid isError", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = validAgenda();
+    const res = await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_availability",
+          arguments: { date: "2026-02-30" },
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "date_invalid" }),
+    );
+  });
+
+  it("rejects unexpected arguments via SDK invalid params", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = validAgenda();
+    const date = futureOpenDate();
+    const res = await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_availability",
+          arguments: { date, extra: "not-allowed" },
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toMatch(/-32602/);
+    expect(kv.get).not.toHaveBeenCalled();
+  });
+
+  it("Actor throws → service_unavailable isError", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = throwingAgenda();
+    const date = futureOpenDate();
+    const res = await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_availability",
+          arguments: { date },
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
   });
 });

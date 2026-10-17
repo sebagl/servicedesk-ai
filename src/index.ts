@@ -96,7 +96,7 @@ export default {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
 
-      return handleMcpRequest(req, env.CONFIG);
+      return handleMcpRequest(req, { config: env.CONFIG, agenda: env.AGENDA });
     }
 
     // --- Demo routes (smoke-test only, auth-gated) ---

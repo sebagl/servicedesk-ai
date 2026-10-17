@@ -30,7 +30,7 @@ export type AvailabilityError =
   | { kind: "service_unavailable" };
 
 type AgendaStub = ActorStub & Pick<DayAgenda, "getOccupiedSlots">;
-interface AgendaNamespace extends ActorNamespace {
+export interface AgendaNamespace extends ActorNamespace {
   idFromName(name: string): AgendaStub;
 }
 

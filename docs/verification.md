@@ -1928,3 +1928,37 @@ dependencies, bindings, credentials, and remote resources: **unchanged**.
 - The malformed-occupancy validation is runtime-only; it does not heal
   the persisted Actor state. If a corrupted aggregate ever exists in
   real storage, the read will throw and the caller will see 503.
+
+## 3.1b — Remote MCP endpoint with get_service_catalog (manual user execution)
+
+Date: 2026-10-16. Executed manually by the user against the deployed function.
+
+### Environment
+
+- Endpoint: `https://servicedesk-ai-a666861a-1.telnyxcompute.com/mcp`
+- Transport: MCP Streamable HTTP, stateless, JSON responses
+  (`@modelcontextprotocol/sdk` 1.32.1, `zod` 4.6.7)
+- Auth: `Authorization: Bearer <MCP_API_TOKEN>` (secret binding `MCP_AUTH`,
+  separate from `SMOKE_AUTH`). Token value not recorded.
+
+### Requests and results
+
+| Check | Request | Result |
+|---|---|---|
+| Protocol negotiation | `initialize` (protocolVersion `2025-06-18`) | 200 — `protocolVersion: 2025-06-18`, `capabilities.tools`, `serverInfo: servicedesk-ai 0.0.0` |
+| Tool call | `tools/call get_service_catalog` with `{}` | 200 — 3 services (`oil_change`, `tire_rotation`, `general_maintenance`, 60 min each), `booking_enabled: true`, read from remote KV |
+| Auth gate | POST without `Authorization` | 401 |
+
+### Verified
+
+- The official MCP TypeScript SDK (including its Ajv JSON-schema validator)
+  runs in the Telnyx Edge runtime inside the existing `telnyx.toml` fetch handler.
+- `/mcp` rejects unauthenticated requests before protocol processing.
+- The tool reads live configuration from KV through the existing `loadConfig`.
+
+### Not verified
+
+- Connection from a Telnyx AI Assistant. In particular, whether its MCP client
+  sends an `Origin` header (rejected with 404 by this MVP).
+- `get_availability` and `create_booking` tools (not implemented yet).
+- Structured logging for `/mcp` (not implemented yet).
