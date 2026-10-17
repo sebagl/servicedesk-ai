@@ -1,8 +1,12 @@
 import { isValidDate, isValidTimeSyntax } from "./scheduling";
 import { loadConfig } from "./config";
-import { agendaActorName } from "./domain/business-rules";
-import type { DayAgenda, CreateBookingInput, CreateBookingResult } from "./agenda-actor";
+import {
+  createBooking as createBookingService,
+  type BookingRequest,
+  type BookingServiceResult,
+} from "./booking-service";
 import type { ActorNamespace, ActorStub, KvNamespace, Secrets } from "@telnyx/edge-runtime";
+import type { DayAgenda } from "./agenda-actor";
 
 const MAX_BODY_BYTES = 10 * 1024; // 10 KiB
 
@@ -89,17 +93,7 @@ async function readBoundedBody(
   }
 }
 
-interface StructuredRequest {
-  service_id: string;
-  date: string;
-  time: string;
-  customer_name: string;
-  customer_phone: string;
-  idempotency_key: string;
-  confirmed: boolean;
-}
-
-function validateStructure(raw: unknown): StructuredRequest | { error: string } {
+function validateStructure(raw: unknown): BookingRequest | { error: string } {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return { error: "bad_request" };
   }
@@ -148,6 +142,26 @@ function validateStructure(raw: unknown): StructuredRequest | { error: string } 
   };
 }
 
+function mapServiceResultToHttp(result: BookingServiceResult): BookingResponse {
+  switch (result.kind) {
+    case "confirmed":
+      return {
+        status: 200,
+        body: {
+          booking_id: result.booking_id,
+          service_id: result.service_id,
+          date: result.date,
+          time: result.time,
+          status: "confirmed",
+        },
+      };
+    case "rejected":
+      return { status: 400, body: { error: result.code } };
+    case "infrastructure_error":
+      return { status: 503, body: { error: "service_unavailable" } };
+  }
+}
+
 export async function handleBookingRequest(
   req: Request,
   env: Env,
@@ -169,97 +183,26 @@ export async function handleBookingRequest(
     return { status: 400, body: { error: "bad_request" } };
   }
 
-  // Step 3: Structural validation
+  // Step 3: Structural validation (transport-layer concern: shape, sizes, types)
   const structured = validateStructure(parsed);
   if ("error" in structured) {
     return { status: 400, body: { error: structured.error } };
   }
 
-  // Step 4: Check bindings
+  // Step 4: Check bindings — fail closed before reaching the service.
   if (!env.CONFIG || !env.AGENDA) {
     return { status: 503, body: { error: "service_unavailable" } };
   }
 
-  // Step 5: Load trusted configuration
-  const cfgResult = await loadConfig(env.CONFIG);
-  if (!cfgResult.ok) {
-    return { status: 503, body: { error: "service_unavailable" } };
-  }
+  // Step 5: Delegate to the transport-independent service. The adapter only
+  // wires env into the minimal structural deps the service declares.
+  const result = await createBookingService(structured, {
+    loadConfig: async () => {
+      const r = await loadConfig(env.CONFIG!);
+      return r.ok ? r.config : null;
+    },
+    getAgenda: (name) => env.AGENDA!.idFromName(name),
+  });
 
-  // Step 6: Route to Actor — no timestamp passed
-  const actorName = agendaActorName(cfgResult.config.business.location_id, structured.date);
-  let actorResult: CreateBookingResult;
-  try {
-    const stub = env.AGENDA.idFromName(actorName);
-    const input: CreateBookingInput = {
-      service_id: structured.service_id,
-      date: structured.date,
-      time: structured.time,
-      customer_name: structured.customer_name,
-      customer_phone: structured.customer_phone,
-      idempotency_key: structured.idempotency_key,
-      confirmed: structured.confirmed,
-      config: cfgResult.config,
-    };
-    actorResult = await stub.createBooking(input);
-  } catch {
-    return { status: 503, body: { error: "service_unavailable" } };
-  }
-
-  // Step 7: Validate and map Actor response
-  if (
-    typeof actorResult !== "object" ||
-    actorResult === null ||
-    typeof (actorResult as { ok?: unknown }).ok !== "boolean"
-  ) {
-    return { status: 503, body: { error: "service_unavailable" } };
-  }
-
-  if (actorResult.ok) {
-    const r = actorResult as { ok: true; booking_id: string; service_id: string; date: string; time: string; status: string };
-    if (
-      typeof r.booking_id !== "string" ||
-      typeof r.service_id !== "string" ||
-      typeof r.date !== "string" ||
-      typeof r.time !== "string" ||
-      r.status !== "confirmed"
-    ) {
-      return { status: 503, body: { error: "service_unavailable" } };
-    }
-    return {
-      status: 200,
-      body: {
-        booking_id: r.booking_id,
-        service_id: r.service_id,
-        date: r.date,
-        time: r.time,
-        status: "confirmed",
-      },
-    };
-  }
-
-  const r = actorResult as { ok: false; code: string };
-  if (typeof r.code !== "string" || r.code.length === 0) {
-    return { status: 503, body: { error: "service_unavailable" } };
-  }
-
-  // Known domain rejection codes → 400
-  const domainErrors = new Set([
-    "unknown_service",
-    "date_out_of_range",
-    "date_not_open",
-    "time_invalid",
-    "confirmation_required",
-    "booking_disabled",
-    "slot_in_past",
-    "slot_unavailable",
-    "idempotency_key_conflict",
-  ]);
-
-  if (domainErrors.has(r.code)) {
-    return { status: 400, body: { error: r.code } };
-  }
-
-  // Unknown error code → generic 503
-  return { status: 503, body: { error: "service_unavailable" } };
+  return mapServiceResultToHttp(result);
 }
