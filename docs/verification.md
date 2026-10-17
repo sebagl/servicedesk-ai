@@ -1733,3 +1733,198 @@ The KV toggle cycle is complete:
 
 Remote KV now matches the repository seed. No redeploy was needed at any
 point — all KV toggles were live without `ship`.
+
+## 3.x — Focused review fixes: state consistency, body-reader errors, malformed occupancy
+
+**Date:** 2026-10-16
+**Scope:** Three narrowly-scoped correctness fixes uncovered by review of the
+phase 2 booking domain. All changes are local; no remote state, bindings,
+credentials, business rules, or stored-state format changed.
+**Not claimed:** production incidents, deployment behavior, runtime
+behavior beyond mocked unit tests.
+
+### Environment
+
+- Local Vitest suite only (`npm run test`, `npm run typecheck`).
+- `@telnyx/edge-runtime` is mocked in `test/agenda-actor.test.ts`,
+  `test/availability.test.ts`, and `test/bookings.test.ts`. No remote KV,
+  Actor storage, or live runtime is touched.
+- Working tree inspected before edits; existing changes from prior subtasks
+  were preserved.
+
+### Fix 1 — Persisted agenda consistency (record-key validation)
+
+`DayAgenda.validateState()` already checked each booking's own fields
+(`id`, `date`, `time`, `idempotency_key`, ...) and each idempotency
+entry's reference back to its booking. It did NOT verify that the record
+key equalled the booking's own `time` field, or that the idempotency
+record key equalled the referenced booking's `idempotency_key`. A key
+mismatch would silently desynchronize the in-memory aggregate from the
+record contents.
+
+**Change (src/agenda-actor.ts):**
+
+```ts
+// bookings loop
+const booking = validateBooking(value, raw.date);
+if (booking.time !== key)
+  throw new Error(`booking key does not match booking.time: ${key}`);
+bookings[key] = booking;
+
+// idempotency loop
+const entry = validateIdempotencyEntry(value, bookings);
+const referenced = bookings[entry.booking_time]!;
+if (referenced.idempotency_key !== key)
+  throw new Error(`idempotency key does not match referenced booking: ${key}`);
+idempotency[key] = entry;
+```
+
+Inconsistent state throws, never silently returns empty availability.
+Existing booking ID/date/reference validation preserved (verified by all
+prior tests still passing).
+
+### Fix 2 — Bounded HTTP body-reader errors
+
+`readBoundedBody()` in `src/bookings.ts` could let two failure modes
+escape:
+
+1. A rejected `reader.read()` (e.g. aborted connection) bubbled out as an
+   unhandled error.
+2. The `reader.cancel()` on the oversized-body path was `await`ed
+   directly — if cancel rejected, the 413 response was never delivered
+   and the caller saw a thrown error.
+
+The 10 KiB byte limit and bounded buffering were preserved.
+
+**Change (src/bookings.ts):**
+
+```ts
+async function readBoundedBody(req: Request): Promise<
+  | { ok: true; text: string }
+  | { ok: false; status: 400 }
+  | { ok: false; status: 413 }
+> {
+  const reader = req.body?.getReader();
+  if (!reader) return { ok: true, text: "" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch {
+        return { ok: false, status: 400 }; // generic bad_request
+      }
+      if (readResult.done) break;
+      total += readResult.value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        return { ok: false, status: 413 }; // cancel handled in finally
+      }
+      chunks.push(readResult.value);
+    }
+    // ... decode ...
+    return { ok: true, text };
+  } finally {
+    try { await reader.cancel(); } catch { /* release lock */ }
+  }
+}
+```
+
+The handler maps `{ ok: false, status: 400 }` → `400 { error: "bad_request" }`
+and `{ ok: false, status: 413 }` → `413 { error: "payload_too_large" }`.
+No raw exception, body content, or credentials are logged or returned.
+
+### Fix 3 — Malformed occupancy response validation
+
+`getAvailability()` validated only that `occupied` was an array of
+strings. A non-canonical value like `"10:0"` (passes `typeof === "string"`)
+or a duplicate entry would silently be accepted. `new Set(occupied)` would
+even dedupe duplicates for free, masking the corruption.
+
+**Change (src/availability.ts):** validate each entry against the
+canonical slot starts imported from `domain/business-rules`:
+
+```ts
+const VALID_SLOT_STARTS: ReadonlySet<string> = new Set(SLOT_START_TIMES);
+// ...
+if (!Array.isArray(occupied)) return { kind: "service_unavailable" };
+const occupiedSet = new Set<string>();
+for (const t of occupied) {
+  if (typeof t !== "string" || !VALID_SLOT_STARTS.has(t))
+    return { kind: "service_unavailable" };
+  if (occupiedSet.has(t))
+    return { kind: "service_unavailable" };
+  occupiedSet.add(t);
+}
+```
+
+Rejection is fail-closed as `service_unavailable`. Invalid entries are
+NOT silently dropped. Valid empty/populated responses still parse.
+
+### Commands and results
+
+```
+$ npm run typecheck
+> tsc --noEmit
+(no output, exit 0)
+
+$ npm test
+> vitest run
+
+ ✓ test/scheduling.test.ts            (58 tests)
+ ✓ test/agenda-actor.test.ts          (64 tests)   ← was 58 (+6 regression)
+ ✓ test/availability.test.ts          (37 tests)   ← was 32 (+5 regression)
+ ✓ test/smoke.test.ts                 (33 tests)
+ ✓ test/bookings.test.ts              (43 tests)   ← was 41 (+2 regression)
+ ✓ test/scheduling.tz-independence.test.ts (13 tests)
+
+ Test Files  6 passed (6)
+      Tests  248 passed (248)
+```
+
+### Test additions (13 new, all passing)
+
+| Suite | Test | Asserts |
+|---|---|---|
+| `agenda-actor.test.ts` | booking key "10:00" with `booking.time` "11:00" throws | key/booking.time consistency |
+| `agenda-actor.test.ts` | booking key "09:00" with `booking.time` "10:00" throws | key/booking.time consistency |
+| `agenda-actor.test.ts` | idempotency key differs from referenced `booking.idempotency_key` throws | key/reference consistency |
+| `agenda-actor.test.ts` | otherwise-valid inconsistent fixture throws (not empty) | aggregate-level integrity |
+| `agenda-actor.test.ts` | valid existing record (key matches `booking.time`) still parses | no regression |
+| `agenda-actor.test.ts` | reserved-looking idempotency key with consistent data still parses | no regression |
+| `bookings.test.ts` | 400 with `bad_request` body when stream read rejects | KV/Actor not reached; raw error not leaked |
+| `bookings.test.ts` | 413 still returned when oversized body and `cancel()` rejects | cancel rejection swallowed; raw error not leaked |
+| `availability.test.ts` | malformed `"10:0"` returns `service_unavailable` | canonical slot start enforced |
+| `availability.test.ts` | malformed `"not-a-time"` returns `service_unavailable` | canonical slot start enforced |
+| `availability.test.ts` | duplicate slot values returns `service_unavailable` | duplicate detection |
+| `availability.test.ts` | valid empty Actor response still returns 8 available slots | no regression |
+| `availability.test.ts` | valid populated Actor response still marks slots unavailable | no regression |
+
+### Behavior changes
+
+1. `DayAgenda.validateState()` now throws on record-key mismatches (was:
+   accepted silently).
+2. `handleBookingRequest` returns 400 `{ error: "bad_request" }` on a
+   rejected body read (was: rejected read bubbled out as unhandled error).
+3. `handleBookingRequest` still returns 413 on oversized bodies even if
+   the reader's cancel() rejects (was: a rejecting cancel prevented the
+   413 response from being sent).
+4. `getAvailability` returns `service_unavailable` on malformed or
+   duplicate slot values from the Actor (was: silently accepted and
+   deduped via `Set`).
+
+Public success contracts, stored-state format, business rules,
+dependencies, bindings, credentials, and remote resources: **unchanged**.
+
+### Limitations of this check
+
+- Discovered and verified with **mocked tests**; no production deployment
+  or live runtime exercised.
+- The new body-reader tests inject a custom `ReadableStream` whose
+  `start()` calls `controller.error()` (rejected read) and whose `cancel()`
+  throws (cancel rejection). Real undici/Node fetch behavior may differ
+  for streams supplied from the network.
+- The malformed-occupancy validation is runtime-only; it does not heal
+  the persisted Actor state. If a corrupted aggregate ever exists in
+  real storage, the read will throw and the caller will see 503.

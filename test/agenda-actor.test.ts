@@ -21,6 +21,7 @@ import {
   computeFingerprint,
 } from "../src/agenda-actor";
 import type { AppConfig } from "../src/config";
+import { createFakeStorage } from "./support/fake-actor-storage";
 
 // ---------------------------------------------------------------------------
 // Fixtures — realistic dates, not placeholders.
@@ -248,6 +249,120 @@ describe("DayAgenda.getOccupiedSlots", () => {
       });
       const actor = makeActor({ get: vi.fn(async () => bad) });
       await expect(actor.getOccupiedSlots()).rejects.toThrow();
+    });
+  });
+
+  describe("record-key consistency in persisted state", () => {
+    it("booking key '10:00' with booking.time '11:00' throws (not empty)", async () => {
+      const bad = validState({
+        "10:00": booking("11:00", "b-001"),
+      });
+      const actor = makeActor({ get: vi.fn(async () => bad) });
+      await expect(actor.getOccupiedSlots()).rejects.toThrow();
+    });
+
+    it("booking key '09:00' with booking.time '10:00' throws (not empty)", async () => {
+      const bad = validState({
+        "09:00": booking("10:00", "b-001"),
+      });
+      const actor = makeActor({ get: vi.fn(async () => bad) });
+      await expect(actor.getOccupiedSlots()).rejects.toThrow();
+    });
+
+    it("idempotency key that differs from referenced booking.idempotency_key throws", async () => {
+      const state = {
+        date: AGENDA_DATE,
+        bookings: {
+          "10:00": booking("10:00", "b-actual"),
+        },
+        idempotency: {
+          "wrong-key": {
+            input_hash: "abc",
+            booking_id: "b-actual",
+            booking_time: "10:00",
+          },
+        },
+      };
+      const actor = makeActor({ get: vi.fn(async () => state) });
+      await expect(actor.getOccupiedSlots()).rejects.toThrow();
+    });
+
+    it("otherwise-valid inconsistent fixture: mismatched booking.time", async () => {
+      // All other fields are valid; the only inconsistency is key vs booking.time.
+      // The aggregate must not be silently coerced into empty availability.
+      const inconsistent = {
+        date: AGENDA_DATE,
+        bookings: {
+          "13:00": {
+            id: "b-001",
+            service_id: "oil_change",
+            date: AGENDA_DATE,
+            time: "14:00", // inconsistent with key "13:00"
+            customer_name: "test",
+            customer_phone: "test",
+            created_at: "2026-10-19T10:00:00Z",
+            idempotency_key: "key-b-001",
+          },
+        },
+        idempotency: {
+          "key-b-001": {
+            input_hash: "abc",
+            booking_id: "b-001",
+            booking_time: "13:00",
+          },
+        },
+      };
+      const actor = makeActor({ get: vi.fn(async () => inconsistent) });
+      await expect(actor.getOccupiedSlots()).rejects.toThrow();
+    });
+
+    it("valid existing record (key matches booking.time) still parses", async () => {
+      const state = validState({
+        "09:00": booking("09:00", "b-001"),
+        "13:00": booking("13:00", "b-002"),
+      });
+      const actor = makeActor({ get: vi.fn(async () => state) });
+      const result = await actor.getOccupiedSlots();
+      expect(result.occupied).toEqual(["09:00", "13:00"]);
+    });
+
+    it("reserved-looking booking slot key with consistent booking.time still parses", async () => {
+      // Reserved-looking booking slot would fail VALID_SLOT_KEYS, so use a
+      // reserved-looking IDEMPOTENCY key instead. The idempotency key is a
+      // free-form string, not a slot.
+      const fp = computeFingerprint({
+        service_id: "oil_change",
+        date: AGENDA_DATE,
+        time: "10:00",
+        customer_name: "test",
+        customer_phone: "test",
+        confirmed: true,
+      });
+      const state: DayAgendaState = {
+        date: AGENDA_DATE,
+        bookings: {
+          "10:00": {
+            id: "b-001",
+            service_id: "oil_change",
+            date: AGENDA_DATE,
+            time: "10:00",
+            customer_name: "test",
+            customer_phone: "test",
+            created_at: "2026-10-19T10:00:00Z",
+            idempotency_key: "__proto__",
+          },
+        },
+        idempotency: {
+          __proto__: {
+            input_hash: fp,
+            booking_id: "b-001",
+            booking_time: "10:00",
+          },
+        },
+      };
+      const actor = makeActor({ get: vi.fn(async () => state) });
+      const result = await actor.getOccupiedSlots();
+      expect(result.occupied).toEqual(["10:00"]);
     });
   });
 
@@ -913,4 +1028,60 @@ describe("DayAgenda.createBooking", () => {
       expect(json).not.toContain("1234");
     });
   });
+});
+
+// ===========================================================================
+// Regression: reserved-looking idempotency keys survive JSON round-trip
+// validateState() previously built records with {} (plain prototypes).
+// Assigning to "__proto__" hits the prototype setter instead of creating
+// an own property, so hasOwn() misses it and the entry is lost on spread.
+// The serializing fake reveals this because put() stores JSON and get()
+// returns a fresh deserialized copy — the live reference trick hides it.
+// ===========================================================================
+
+describe("regression: reserved-key idempotency survives JSON round-trip", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(localEpochMS("2026-10-20", 8, 0));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const reservedKeys = ["__proto__", "constructor", "hasOwnProperty"];
+
+  for (const key of reservedKeys) {
+    it(`replay of "${key}" through serializing fake returns booking_id`, async () => {
+      const storage = createFakeStorage();
+      const actor1 = new DayAgenda(
+        { storage } as never,
+        {} as never,
+      );
+      // First call: create the booking
+      const r1 = await actor1.createBooking(
+        makeBookingInput({ idempotency_key: key }),
+      );
+      expect(r1.ok).toBe(true);
+      if (!r1.ok) return;
+      const originalId = r1.booking_id;
+
+      // Exactly one put during creation
+      expect(storage.put).toHaveBeenCalledTimes(1);
+
+      // Replay through the serializing fake (get returns JSON-parsed copy)
+      const actor2 = new DayAgenda(
+        { storage } as never,
+        {} as never,
+      );
+      const r2 = await actor2.createBooking(
+        makeBookingInput({ idempotency_key: key }),
+      );
+      expect(r2.ok).toBe(true);
+      if (!r2.ok) return;
+      expect(r2.booking_id).toBe(originalId);
+
+      // Replay must not write
+      expect(storage.put).toHaveBeenCalledTimes(1);
+    });
+  }
 });

@@ -221,3 +221,211 @@ All existing createBooking tests were converted from `input.now` to
 > admission entirely. Tests use Vitest's `vi.setSystemTime` instead of an
 > injected parameter. A regression test verifies that a slot which starts
 > during a slow storage read is rejected.
+
+## DayAgenda `__proto__` idempotency key lost on persistence round-trip
+
+### Context
+
+`DayAgenda.createBooking` stores a `DayAgendaState` aggregate containing a
+`bookings` record keyed by slot time and an `idempotency` record keyed by
+the client-supplied idempotency key. On a replay, `validateState()` reads
+the persisted state, builds fresh records, and uses `hasOwn()` to look up
+the idempotency entry. If the key is `"__proto__"`, the assignment
+`idempotency[key] = ...` on a plain `{}` object silently sets the prototype
+instead of creating an own property — so `hasOwn()` never finds it, the
+entry is lost on `{ ...state.idempotency }` spread, and the replay returns
+`slot_unavailable` instead of the original booking.
+
+### Discovery
+
+The bug was identified by code review prompted by the observation that a
+booking with `idempotency_key: "__proto__"` succeeds on the first call but
+returns `{ ok: false, code: "slot_unavailable" }` on identical replay after a
+storage round-trip. Existing tests did not catch it because the mocks returned
+live object references — the `__proto__` assignment landed on the prototype
+but the test could still read it (the live object had the prototype set), and
+no JSON serialization step existed in the test harness.
+
+### Root cause
+
+`validateState()` built records with plain object literals:
+
+```ts
+const bookings: Record<string, Booking> = {};
+const idempotency: Record<string, IdempotencyEntry> = {};
+```
+
+JavaScript's `{}` object has a prototype chain with a `__proto__` setter.
+Assigning to `obj["__proto__"]` on such an object triggers the setter rather
+than creating an own enumerable property. `hasOwn(".__proto__")` returns
+`false` — the entry was never stored as own data. On the next read, the
+entry is gone from `Object.entries()` and from `{ ...spread }`, so the
+Actor treats the replay as a new attempt and rejects it as `slot_unavailable`.
+
+`createBooking` also used spread (`{ ...state.idempotency }`) to build the
+new aggregate, which produces a plain `{}` — so even if the loaded state
+had a null-prototype idempotency record, the write would reintroduce the bug
+on the next round trip.
+
+### Risk
+
+Any idempotency key that collides with a prototype property name (primarily
+`"__proto__"`) would silently lose its booking on replays after a storage
+round-trip. The booking itself persisted (in `bookings[time]`), but the
+idempotency link was lost, so replays created a duplicate attempt that was
+rejected as `slot_unavailable` — correct rejection (slot occupied) but
+wrong reason (should be replay, not conflict). The customer would see a
+failed retry for a booking that succeeded. This is a correctness risk, not
+a security or double-booking risk.
+
+### Fix
+
+Build both `bookings` and `idempotency` records with `Object.create(null)`
+in `validateState()`:
+
+```ts
+const bookings = Object.create(null);
+// ... bookings[key] = validateBooking(...)
+const idempotency = Object.create(null);
+// ... idempotency[key] = validateIdempotencyEntry(...)
+```
+
+Also fixed `createBooking`'s `newState` construction to use
+`Object.assign(Object.create(null), ...)` instead of spread:
+
+```ts
+const newBookings = Object.assign(Object.create(null), state.bookings);
+newBookings[time] = newBooking;
+const newIdempotency = Object.assign(Object.create(null), state.idempotency);
+newIdempotency[key] = { ... };
+```
+
+The persisted JSON shape is unchanged — `JSON.stringify` of a null-prototype
+object produces the same output as a plain object. Existing remote state is
+unaffected. On the next read, `validateState()` reconstructs with null
+prototypes, so even existing persisted data with `"__proto__"` keys (from
+before the fix) is now handled correctly.
+
+### Regression coverage
+
+A new `test/support/fake-actor-storage.ts` provides an in-memory
+`ActorStorage` fake whose `put()` serializes via `JSON.stringify` and `get()`
+returns a `JSON.parse`d fresh copy — mimicking real persistence so live
+reference tricks no longer hide the bug.
+
+Three regression tests cover `"__proto__"`, `"constructor"`, and
+`"hasOwnProperty"`: each creates a booking, then issues an identical replay
+through the serializing fake, and asserts the same `booking_id` is returned
+with `put()` called exactly once. These tests failed before the fix (for
+`"__proto__"`) and pass after.
+
+### Evidence
+
+**Before fix (failing):**
+```
+× regression: reserved-key idempotency survives JSON round-trip
+  > replay of "__proto__" through serializing fake returns booking_id
+  → expected false to be true
+Tests  1 failed | 4 passed | 53 skipped
+```
+
+**After fix (passing):**
+```
+✓ test/agenda-actor.test.ts (58 tests)
+Tests  235 passed (235)
+```
+
+- `npm run typecheck` — **0 errors**
+- `npm run test` — **235/235 passed** (was 232; +3 regression tests)
+- Changed files: `src/agenda-actor.ts` (null-prototype records + Object.assign in createBooking), `test/agenda-actor.test.ts` (3 new regression tests), `test/support/fake-actor-storage.ts` (new fake storage)
+
+### Interview explanation
+
+> `validateState()` built idempotency records with `{}`, so
+> `obj["__proto__"] = entry` hit the prototype setter instead of creating an
+> own property. On replay, `hasOwn("__proto__")` returned false, the entry
+> was lost, and the Actor treated the replay as a new booking — rejected as
+> `slot_unavailable`. The fix uses `Object.create(null)` for both records and
+> `Object.assign(Object.create(null), ...)` in `createBooking`'s spread. A
+> serializing fake storage (`JSON.stringify` / `JSON.parse`) was added to
+> reveal the bug that live-reference mocks hid.
+
+## Persisted agenda: record-key mismatch not validated
+
+### Context
+
+`DayAgenda.validateState()` checked each booking's own fields and each
+idempotency entry's reference back to its booking. It did not verify that
+the record key equalled the booking's own `time` field, or that an
+idempotency record key equalled the referenced booking's
+`idempotency_key`. A key mismatch (e.g. `bookings["10:00"]` containing a
+booking with `time: "11:00"`) would silently desynchronize the in-memory
+aggregate from the record contents.
+
+### Discovery
+
+Found by code review of the phase 2 booking domain — no production
+incident is claimed. The pre-fix validator would accept the inconsistent
+record and return the (now-misaligned) occupied slots downstream.
+
+### Fix
+
+In `validateState`, after each booking is validated, require
+`booking.time === key`. After each idempotency entry is validated,
+require the referenced booking's `idempotency_key === key`. Both
+mismatches throw, so the caller maps to a generic 503 rather than
+returning an empty or misaligned availability result. Existing booking
+ID/date/reference validation is preserved.
+
+## Body-reader: rejected read and rejecting cancel escaped the handler
+
+### Context
+
+`readBoundedBody()` in `src/bookings.ts` only awaited `reader.read()` and
+`reader.cancel()` directly. Two failure modes were not handled:
+
+1. A rejected `read()` (e.g. aborted connection) bubbled out of the
+   function as an unhandled error.
+2. The `cancel()` on the oversized-body path was `await`ed without a
+   guard. If it rejected, the 413 response was never delivered and the
+   caller saw a thrown error.
+
+### Discovery
+
+Found by code review — no production incident is claimed. The 10 KiB
+byte limit and bounded buffering were not changed.
+
+### Fix
+
+Wrap `reader.read()` in a local `try/catch` that returns
+`{ ok: false, status: 400 }` on rejection. Move `reader.cancel()` into a
+`finally` block that swallows any rejection so the reader lock is always
+released and the response (413 for oversized, 400 for read failure) is
+always delivered. The handler maps both variants to the correct public
+response codes without logging raw exception messages, body content, or
+credentials.
+
+## Occupancy response: malformed and duplicate slot values were silently accepted
+
+### Context
+
+`getAvailability()` validated only that `occupied` was an array of
+strings. A non-canonical value like `"10:0"` (passes `typeof ===
+"string"`) or a duplicate entry would be silently accepted. The
+subsequent `new Set(occupied)` even deduplicated duplicates for free,
+masking the corruption. The downstream `slots` array could over-report
+availability if the Actor returned bad data.
+
+### Discovery
+
+Found by code review of the Actor-response validator in
+`src/availability.ts` — no production incident is claimed.
+
+### Fix
+
+Import `SLOT_START_TIMES` from `domain/business-rules.ts` (the same
+shared rule the Actor uses for persisted slot validation) and require
+every entry in `occupied` to be a string in that set, with no
+duplicates. Any failure returns `{ kind: "service_unavailable" }` —
+fail-closed, no silent dropping. Valid empty and populated responses
+still parse and produce the same `slots` output.

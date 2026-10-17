@@ -366,6 +366,136 @@ describe("POST /demo/bookings", () => {
     });
   });
 
+  describe("body reader lock release", () => {
+    // cancel() and read() returning done do NOT release the reader lock.
+    // readBoundedBody() must call reader.releaseLock() explicitly so the
+    // request body can be consumed elsewhere (or GC'd) after the handler
+    // completes. These tests assert req.body.locked === false on success,
+    // oversized body, failed read, and a never-settling cancel.
+
+    it("success path: 200, body.locked is false, Actor reached", async () => {
+      const stub: AgendaStub = {
+        getOccupiedSlots: vi.fn(),
+        createBooking: vi.fn(async () => SUCCESS_RESULT),
+      };
+      const kv = validKv();
+      const { env } = makeEnv(stub, validSecrets(), kv);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(validBody())));
+          controller.close();
+        },
+      });
+      const req = new Request("http://x/demo/bookings", {
+        method: "POST",
+        body: stream,
+        ...({ duplex: "half" } as Record<string, unknown>),
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${VALID_TOKEN}`,
+        },
+      });
+      const res = await handler.fetch(req, env as never);
+      expect(res.status).toBe(200);
+      expect(stub.createBooking).toHaveBeenCalled();
+      expect(req.body).not.toBeNull();
+      expect(req.body!.locked).toBe(false);
+    });
+
+    it("oversized body: 413, body.locked is false, Actor not reached", async () => {
+      const stub: AgendaStub = { getOccupiedSlots: vi.fn(), createBooking: vi.fn() };
+      const kv = validKv();
+      const { env } = makeEnv(stub, validSecrets(), kv);
+      const big = new Uint8Array(10 * 1024 + 100);
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(big);
+        },
+        cancel() {
+          // Rejection is absorbed by .catch() in readBoundedBody. releaseLock()
+          // must run independently and synchronously.
+          throw new Error("cancel failed");
+        },
+      });
+      const req = new Request("http://x/demo/bookings", {
+        method: "POST",
+        body: stream,
+        ...({ duplex: "half" } as Record<string, unknown>),
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${VALID_TOKEN}`,
+        },
+      });
+      const res = await handler.fetch(req, env as never);
+      expect(res.status).toBe(413);
+      expect(await res.json()).toEqual({ error: "payload_too_large" });
+      expect(kv.get).not.toHaveBeenCalled();
+      expect(stub.createBooking).not.toHaveBeenCalled();
+      expect(req.body!.locked).toBe(false);
+    });
+
+    it("failed read: 400, body.locked is false, Actor not reached", async () => {
+      const stub: AgendaStub = { getOccupiedSlots: vi.fn(), createBooking: vi.fn() };
+      const kv = validKv();
+      const { env } = makeEnv(stub, validSecrets(), kv);
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.error(new Error("connection reset"));
+        },
+      });
+      const req = new Request("http://x/demo/bookings", {
+        method: "POST",
+        body: stream,
+        ...({ duplex: "half" } as Record<string, unknown>),
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${VALID_TOKEN}`,
+        },
+      });
+      const res = await handler.fetch(req, env as never);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "bad_request" });
+      expect(kv.get).not.toHaveBeenCalled();
+      expect(stub.createBooking).not.toHaveBeenCalled();
+      expect(req.body!.locked).toBe(false);
+    });
+
+    it("413 returned even when cancel() never settles (non-hanging regression)", async () => {
+      // cancel() returns a promise that never resolves. The finally block
+      // must NOT await cancel() — otherwise the function would hang. releaseLock()
+      // runs synchronously after the fire-and-forget cancel(), so the body
+      // lock is freed even when the underlying source is wedged.
+      const stub: AgendaStub = { getOccupiedSlots: vi.fn(), createBooking: vi.fn() };
+      const kv = validKv();
+      const { env } = makeEnv(stub, validSecrets(), kv);
+      const big = new Uint8Array(10 * 1024 + 100);
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(big);
+        },
+        cancel() {
+          return new Promise<void>(() => {});
+        },
+      });
+      const req = new Request("http://x/demo/bookings", {
+        method: "POST",
+        body: stream,
+        ...({ duplex: "half" } as Record<string, unknown>),
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${VALID_TOKEN}`,
+        },
+      });
+      const res = await handler.fetch(req, env as never);
+      expect(res.status).toBe(413);
+      expect(await res.json()).toEqual({ error: "payload_too_large" });
+      expect(kv.get).not.toHaveBeenCalled();
+      expect(stub.createBooking).not.toHaveBeenCalled();
+      // releaseLock() ran synchronously even though cancel() is still pending.
+      expect(req.body!.locked).toBe(false);
+    });
+  });
+
   describe("configuration failure and missing bindings", () => {
     it("503 when CONFIG binding is missing", async () => {
       const stub: AgendaStub = { getOccupiedSlots: vi.fn(), createBooking: vi.fn() };

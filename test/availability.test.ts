@@ -329,6 +329,84 @@ describe("getAvailability service", () => {
       );
       expect(result).toEqual({ kind: "service_unavailable" });
     });
+
+    it("malformed Actor response (syntactic but non-canonical time '10:0') returns service_unavailable", async () => {
+      const stub = {
+        getOccupiedSlots: vi.fn(async () => ({ occupied: ["10:0"] })),
+      };
+      const agenda = { idFromName: vi.fn(() => stub) };
+      const result = await getAvailability(
+        TUE_OCT20,
+        NOW_MON_08,
+        VALID_CONFIG,
+        agenda as never,
+      );
+      expect(result).toEqual({ kind: "service_unavailable" });
+    });
+
+    it("malformed Actor response (non-time string 'not-a-time') returns service_unavailable", async () => {
+      const stub = {
+        getOccupiedSlots: vi.fn(async () => ({ occupied: ["not-a-time"] })),
+      };
+      const agenda = { idFromName: vi.fn(() => stub) };
+      const result = await getAvailability(
+        TUE_OCT20,
+        NOW_MON_08,
+        VALID_CONFIG,
+        agenda as never,
+      );
+      expect(result).toEqual({ kind: "service_unavailable" });
+    });
+
+    it("malformed Actor response (duplicate slot values) returns service_unavailable", async () => {
+      const stub = {
+        getOccupiedSlots: vi.fn(async () => ({ occupied: ["10:00", "10:00"] })),
+      };
+      const agenda = { idFromName: vi.fn(() => stub) };
+      const result = await getAvailability(
+        TUE_OCT20,
+        NOW_MON_08,
+        VALID_CONFIG,
+        agenda as never,
+      );
+      expect(result).toEqual({ kind: "service_unavailable" });
+    });
+
+    it("valid empty Actor response still returns 8 available slots", async () => {
+      const stub = {
+        getOccupiedSlots: vi.fn(async () => ({ occupied: [] })),
+      };
+      const agenda = { idFromName: vi.fn(() => stub) };
+      const result = await getAvailability(
+        TUE_OCT20,
+        NOW_MON_08,
+        VALID_CONFIG,
+        agenda as never,
+      );
+      const slots = (result as AvailabilityResult).slots;
+      expect(slots).toHaveLength(8);
+      slots.forEach((s) => expect(s.available).toBe(true));
+    });
+
+    it("valid populated Actor response still marks occupied slot unavailable", async () => {
+      const stub = {
+        getOccupiedSlots: vi.fn(async () => ({ occupied: ["09:00", "13:00", "16:00"] })),
+      };
+      const agenda = { idFromName: vi.fn(() => stub) };
+      const result = await getAvailability(
+        TUE_OCT20,
+        NOW_MON_08,
+        VALID_CONFIG,
+        agenda as never,
+      );
+      const slots = (result as AvailabilityResult).slots;
+      const nine = slots.find((s) => s.time === "09:00");
+      const one = slots.find((s) => s.time === "13:00");
+      const four = slots.find((s) => s.time === "16:00");
+      expect(nine!.available).toBe(false);
+      expect(one!.available).toBe(false);
+      expect(four!.available).toBe(false);
+    });
   });
 
   describe("timezone and location labels present", () => {

@@ -1,6 +1,5 @@
 import type { BusinessConfig } from "./config";
-
-const TZ = "America/Mexico_City";
+import { TIMEZONE } from "./domain/business-rules";
 
 // ---------------------------------------------------------------------------
 // Date format/calendar validation — pure, no timezone, no I/O
@@ -71,14 +70,24 @@ export function isOpenDay(date: string, openDays: string[]): boolean {
 // Local date/time from injected epoch ms — timezone-aware, no hardcode
 // ---------------------------------------------------------------------------
 
+// Cached at module level — avoids rebuilding on every call (~20 times per
+// availability request). The timezone never changes during the process lifetime.
+const _dateFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: TIMEZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const _timeFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: TIMEZONE,
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
 export function getLocalDateString(now: number): string {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const parts = dtf.formatToParts(new Date(now));
+  const parts = _dateFmt.formatToParts(new Date(now));
   const y = parts.find((p) => p.type === "year")!.value;
   const m = parts.find((p) => p.type === "month")!.value;
   const d = parts.find((p) => p.type === "day")!.value;
@@ -89,13 +98,7 @@ export function getLocalTimeParts(now: number): {
   hour: number;
   minute: number;
 } {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: TZ,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const parts = dtf.formatToParts(new Date(now));
+  const parts = _timeFmt.formatToParts(new Date(now));
   let hour = Number(parts.find((p) => p.type === "hour")!.value);
   if (hour === 24) hour = 0;
   const minute = Number(parts.find((p) => p.type === "minute")!.value);

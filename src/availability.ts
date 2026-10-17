@@ -2,6 +2,12 @@ import type { AppConfig, BusinessConfig } from "./config";
 import type { DayAgenda } from "./agenda-actor";
 import type { ActorNamespace, ActorStub } from "@telnyx/edge-runtime";
 import { generateDaySlots, isValidDate, isDateInWindow } from "./scheduling";
+import { agendaActorName, SLOT_START_TIMES } from "./domain/business-rules";
+
+// Canonical, supported slot start times — shared with the Actor's persisted
+// state validator. Any value outside this set (or any duplicate) is rejected
+// as a malformed occupancy response, not silently dropped.
+const VALID_SLOT_STARTS: ReadonlySet<string> = new Set(SLOT_START_TIMES);
 
 export interface AvailabilitySlot {
   time: string;
@@ -27,9 +33,6 @@ type AgendaStub = ActorStub & Pick<DayAgenda, "getOccupiedSlots">;
 interface AgendaNamespace extends ActorNamespace {
   idFromName(name: string): AgendaStub;
 }
-
-const LOCATION_ID = "main";
-const TIMEZONE = "America/Mexico_City";
 
 // Extracts and validates exactly one `date` query parameter.
 export function validateDateParam(
@@ -62,16 +65,16 @@ export async function getAvailability(
   // If no candidates (weekend, past day, all past times), return empty slots.
   if (candidateTimes.length === 0) {
     return {
-      location_id: LOCATION_ID,
+      location_id: business.location_id,
       date,
-      timezone: TIMEZONE,
+      timezone: business.timezone,
       booking_enabled: business.booking_enabled,
       slots: [],
     };
   }
 
-  // Address the Actor as main-{YYYY-MM-DD}.
-  const actorName = `${LOCATION_ID}-${date}`;
+  // Address the Actor via the shared naming convention.
+  const actorName = agendaActorName(business.location_id, date);
   let occupied: string[];
   try {
     const stub = agenda.idFromName(actorName);
@@ -81,15 +84,24 @@ export async function getAvailability(
     return { kind: "service_unavailable" };
   }
 
-  // Validate Actor response shape at runtime.
-  if (
-    !Array.isArray(occupied) ||
-    !occupied.every((t) => typeof t === "string")
-  ) {
+  // Validate Actor response shape at runtime. Each entry must be a string,
+  // a canonical slot start time (per the shared business-rules), and there
+  // must be no duplicates. Invalid values indicate a corrupted Actor
+  // response — fail closed as service_unavailable rather than silently
+  // discarding entries (which would over-report availability).
+  if (!Array.isArray(occupied)) {
     return { kind: "service_unavailable" };
   }
-
-  const occupiedSet = new Set(occupied);
+  const occupiedSet = new Set<string>();
+  for (const t of occupied) {
+    if (typeof t !== "string" || !VALID_SLOT_STARTS.has(t)) {
+      return { kind: "service_unavailable" };
+    }
+    if (occupiedSet.has(t)) {
+      return { kind: "service_unavailable" };
+    }
+    occupiedSet.add(t);
+  }
 
   const slots: AvailabilitySlot[] = candidateTimes.map((time) => ({
     time,
@@ -97,9 +109,9 @@ export async function getAvailability(
   }));
 
   return {
-    location_id: LOCATION_ID,
+    location_id: business.location_id,
     date,
-    timezone: TIMEZONE,
+    timezone: business.timezone,
     booking_enabled: business.booking_enabled,
     slots,
   };

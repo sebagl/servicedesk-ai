@@ -187,21 +187,36 @@ function validateState(raw: unknown): DayAgendaState {
   // bookings must be a Record<string, Booking>, not an array.
   if (!isObject(raw.bookings)) throw new Error("bookings is not a record");
 
-  const bookings: Record<string, Booking> = {};
+  // Null-prototype objects so "__proto__" as a key becomes an own property,
+  // not a prototype setter. This is the same shape JSON.parse produces.
+  const bookings: Record<string, Booking> = Object.create(null);
   for (const [key, value] of Object.entries(raw.bookings)) {
     if (!VALID_SLOT_KEYS.has(key))
       throw new Error(`invalid slot key in bookings: ${key}`);
-    bookings[key] = validateBooking(value, raw.date);
+    const booking = validateBooking(value, raw.date);
+    // The record key MUST equal the booking's own time field. A mismatch
+    // (e.g. key "10:00" but booking.time "11:00") is a corrupted aggregate —
+    // it could otherwise silently mark the wrong slot occupied.
+    if (booking.time !== key)
+      throw new Error(`booking key does not match booking.time: ${key}`);
+    bookings[key] = booking;
   }
 
   // idempotency must be a Record too.
   if (!isObject(raw.idempotency)) throw new Error("idempotency is not a record");
 
-  const idempotency: Record<string, IdempotencyEntry> = {};
+  const idempotency: Record<string, IdempotencyEntry> = Object.create(null);
   for (const [key, value] of Object.entries(raw.idempotency)) {
     if (!isString(key) || key.length === 0)
       throw new Error("invalid idempotency key");
-    idempotency[key] = validateIdempotencyEntry(value, bookings);
+    const entry = validateIdempotencyEntry(value, bookings);
+    // The idempotency record key MUST equal the referenced booking's
+    // idempotency_key. A mismatch indicates the entry was written for a
+    // different request and would cause replays to look up the wrong entry.
+    const referenced = bookings[entry.booking_time]!;
+    if (referenced.idempotency_key !== key)
+      throw new Error(`idempotency key does not match referenced booking: ${key}`);
+    idempotency[key] = entry;
   }
 
   return {
@@ -377,17 +392,28 @@ export class DayAgenda extends StatefulActor {
       idempotency_key,
     };
 
+    // Build new records with null-prototype objects so "__proto__" and
+    // other reserved-looking keys are own properties, not prototype setters.
+    const newBookings: Record<string, Booking> = Object.assign(
+      Object.create(null),
+      state.bookings,
+    );
+    newBookings[time] = newBooking;
+
+    const newIdempotency: Record<string, IdempotencyEntry> = Object.assign(
+      Object.create(null),
+      state.idempotency,
+    );
+    newIdempotency[idempotency_key] = {
+      input_hash: fingerprint,
+      booking_id: bookingId,
+      booking_time: time,
+    };
+
     const newState: DayAgendaState = {
       date,
-      bookings: { ...state.bookings, [time]: newBooking },
-      idempotency: {
-        ...state.idempotency,
-        [idempotency_key]: {
-          input_hash: fingerprint,
-          booking_id: bookingId,
-          booking_time: time,
-        },
-      },
+      bookings: newBookings,
+      idempotency: newIdempotency,
     };
 
     try {

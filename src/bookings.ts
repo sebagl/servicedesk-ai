@@ -1,5 +1,6 @@
 import { isValidDate, isValidTimeSyntax } from "./scheduling";
 import { loadConfig } from "./config";
+import { agendaActorName } from "./domain/business-rules";
 import type { DayAgenda, CreateBookingInput, CreateBookingResult } from "./agenda-actor";
 import type { ActorNamespace, ActorStub, KvNamespace, Secrets } from "@telnyx/edge-runtime";
 
@@ -32,7 +33,13 @@ export type BookingResponse =
   | { status: 413; body: { error: "payload_too_large" } }
   | { status: 503; body: { error: "service_unavailable" } };
 
-async function readBoundedBody(req: Request): Promise<{ ok: true; text: string } | { ok: false; status: 413 }> {
+async function readBoundedBody(
+  req: Request,
+): Promise<
+  | { ok: true; text: string }
+  | { ok: false; status: 400 }
+  | { ok: false; status: 413 }
+> {
   const reader = req.body?.getReader();
   if (!reader) {
     // No body stream — treat as empty (will fail JSON parse later).
@@ -40,20 +47,46 @@ async function readBoundedBody(req: Request): Promise<{ ok: true; text: string }
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_BODY_BYTES) {
-      // Cancel the reader and return 413.
-      await reader.cancel();
-      return { ok: false, status: 413 };
+  try {
+    for (;;) {
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch {
+        // Stream read failure (network reset, aborted connection). The raw
+        // error is intentionally discarded — surface a generic 400 so the
+        // caller sees a controlled response without leaking internals.
+        return { ok: false, status: 400 };
+      }
+      if (readResult.done) break;
+      const value = readResult.value;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        // Oversized body — return 413 before awaiting cancel so the response
+        // is not blocked if the reader's cancel rejects.
+        return { ok: false, status: 413 };
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+    const decoder = new TextDecoder();
+    const text =
+      chunks.map((c) => decoder.decode(c, { stream: true })).join("") +
+      decoder.decode();
+    return { ok: true, text };
+  } finally {
+    // The reader lock is NOT released by cancel() or by read() returning
+    // done. releaseLock() must be called explicitly. We do NOT await
+    // cancel(): a hanging cancel must never delay the 400/413 response —
+    // the bounded read above already produced the outcome. The .catch()
+    // absorbs any rejection so the cancel promise is never an unhandled
+    // rejection. releaseLock() runs synchronously regardless of whether
+    // the cancel has settled, so the lock is freed promptly even when the
+    // underlying source is wedged.
+    reader.cancel().catch(() => {
+      // intentionally ignored — rejection has no observable effect
+    });
+    reader.releaseLock();
   }
-  const decoder = new TextDecoder();
-  const text = chunks.map((c) => decoder.decode(c, { stream: true })).join("") + decoder.decode();
-  return { ok: true, text };
 }
 
 interface StructuredRequest {
@@ -122,7 +155,10 @@ export async function handleBookingRequest(
   // Step 1: Read bounded body
   const bodyResult = await readBoundedBody(req);
   if (!bodyResult.ok) {
-    return { status: 413, body: { error: "payload_too_large" } };
+    if (bodyResult.status === 413) {
+      return { status: 413, body: { error: "payload_too_large" } };
+    }
+    return { status: 400, body: { error: "bad_request" } };
   }
 
   // Step 2: Parse JSON
@@ -151,7 +187,7 @@ export async function handleBookingRequest(
   }
 
   // Step 6: Route to Actor — no timestamp passed
-  const actorName = `main-${structured.date}`;
+  const actorName = agendaActorName(cfgResult.config.business.location_id, structured.date);
   let actorResult: CreateBookingResult;
   try {
     const stub = env.AGENDA.idFromName(actorName);
