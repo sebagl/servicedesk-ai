@@ -288,3 +288,32 @@ serialization — label real-runtime concurrency verification separately. `[C3]`
 | Actor type name | TBD in implementation | Replace `Counter` demo actor with `DayAgenda` or similar |
 | Confirmation enforcement | Backend precondition only `[C7]` | Conversation workflow must obtain verbal consent; backend cannot verify it happened |
 | Follow-up agent | Future expansion, not implemented | Not in current scope; no extra data collected |
+
+## 10. One booking per conversation
+
+> Status: **APPROVED policy, NOT IMPLEMENTED.** The existing MCP
+> content-derived `idempotency_key` remains the current implementation
+> until a future MCP subtask replaces it with this policy.
+
+- MCP permits **at most one confirmed booking per trusted Telnyx conversation**.
+- Conversation identity is read from **SDK metadata**, never from tool
+  arguments.
+- Missing or invalid conversation identity **blocks `create_booking`**;
+  read tools (`get_service_catalog`, `get_availability`) remain usable.
+- A **conversation-scoped Actor** coordinates booking attempts across
+  different dates.
+- `DayAgenda` (`main-{YYYY-MM-DD}`) remains the **authoritative** owner of
+  slot occupancy and booking persistence.
+- Before calling `DayAgenda`, the conversation Actor **persists the pending
+  attempt** with a backend-generated idempotency key and normalized input.
+- On timeout or infrastructure failure, the pending attempt is **kept**.
+  It is resolved using the **same input and same key** before any changed
+  request is admitted.
+- A **definitive domain rejection** (e.g. `slot_unavailable`, `time_invalid`)
+  permits a new corrected attempt.
+- A confirmed **identical retry** returns the original result.
+- After confirmation, **changed input** returns `conversation_already_booked`
+  and must **not** create, cancel, or reschedule anything.
+- Separate Actors do **not** imply a cross-Actor transaction or exactly-once
+  delivery.
+- Existing HTTP demo endpoint behavior is unchanged.

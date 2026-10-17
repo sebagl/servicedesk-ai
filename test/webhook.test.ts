@@ -368,3 +368,144 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Early rejections — exactly one webhook.rejected log per case, no KV access,
+// no request body / phone / call id leaking into the structured log.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — early rejection logging", () => {
+  function rejections(): Array<Record<string, unknown>> {
+    return logEvents().filter((e) => e.event === "webhook.rejected");
+  }
+
+  it("GET → method_not_allowed at 405, Allow header preserved, no KV access", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const res = await handler.fetch(
+      new Request("http://x/webhooks/dynamic-variables", { method: "GET" }),
+      env as never,
+    );
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST");
+    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(rejections()).toHaveLength(1);
+    const ev = rejections()[0]!;
+    expect(ev.reason).toBe("method_not_allowed");
+    expect(ev.http_status).toBe(405);
+    expect(typeof ev.latency_ms).toBe("number");
+    const serialized = JSON.stringify(ev);
+    expect(serialized).not.toContain("call_control_id");
+    expect(serialized).not.toContain("cc-secret-9876");
+    expect(serialized).not.toContain("asst-secret");
+    expect(serialized).not.toContain("5550001234");
+  });
+
+  it("body over 10 KiB → payload_too_large at 413, no KV access", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const big = new TextEncoder().encode(
+      JSON.stringify({ payload: { pad: "x".repeat(11 * 1024) } }),
+    );
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(big);
+        controller.close();
+      },
+    });
+    const req = new Request("http://x/webhooks/dynamic-variables", {
+      method: "POST",
+      body: stream,
+      headers: { "content-type": "application/json" },
+      duplex: "half",
+    } as RequestInit);
+    const res = await handler.fetch(req, env as never);
+    expect(res.status).toBe(413);
+    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(rejections()).toHaveLength(1);
+    const ev = rejections()[0]!;
+    expect(ev.reason).toBe("payload_too_large");
+    expect(ev.http_status).toBe(413);
+    expect(typeof ev.latency_ms).toBe("number");
+    const serialized = JSON.stringify(ev);
+    expect(serialized).not.toContain("xxxxx");
+    expect(serialized).not.toContain("pad");
+  });
+
+  it("rejecting body stream → body_read_failed at 400, no KV access", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("connection reset"));
+      },
+    });
+    const req = new Request("http://x/webhooks/dynamic-variables", {
+      method: "POST",
+      body: stream,
+      headers: { "content-type": "application/json" },
+      duplex: "half",
+    } as RequestInit);
+    const res = await handler.fetch(req, env as never);
+    expect(res.status).toBe(400);
+    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(rejections()).toHaveLength(1);
+    const ev = rejections()[0]!;
+    expect(ev.reason).toBe("body_read_failed");
+    expect(ev.http_status).toBe(400);
+    expect(typeof ev.latency_ms).toBe("number");
+    const serialized = JSON.stringify(ev);
+    expect(serialized).not.toContain("connection reset");
+    expect(serialized).not.toContain("Error");
+    expect(serialized).not.toContain("stack");
+  });
+
+  it("invalid JSON → invalid_json at 400, no KV access", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const res = await handler.fetch(
+      webhookReq("not json"),
+      env as never,
+    );
+    expect(res.status).toBe(400);
+    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(rejections()).toHaveLength(1);
+    const ev = rejections()[0]!;
+    expect(ev.reason).toBe("invalid_json");
+    expect(ev.http_status).toBe(400);
+    expect(typeof ev.latency_ms).toBe("number");
+  });
+
+  it("does not log the request body, headers, or unvalidated identifiers", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const sentinels = {
+      phone: "+15559990PH0N",
+      callerId: "cc-SENTINEL-CALLER",
+      assistantId: "asst-SENTINEL-ASSIST",
+      auth: "Bearer SENTINEL-AUTH-TOKEN",
+      rawBody:
+        '{"data":{"payload":{"telnyx_end_user_target":"+15559990PH0N","call_control_id":"cc-SENTINEL-CALLER","assistant_id":"asst-SENTINEL-ASSIST",BROKEN',
+    };
+    const res = await handler.fetch(
+      new Request("http://x/webhooks/dynamic-variables", {
+        method: "POST",
+        body: sentinels.rawBody,
+        headers: {
+          "content-type": "application/json",
+          "x-call-control-id": "cc-SENTINEL-CALLER",
+          authorization: sentinels.auth,
+        },
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(400);
+    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(rejections()).toHaveLength(1);
+    expect(rejections()[0]!.reason).toBe("invalid_json");
+    const allSerialized = JSON.stringify(logEvents());
+    expect(allSerialized).not.toContain(sentinels.phone);
+    expect(allSerialized).not.toContain(sentinels.callerId);
+    expect(allSerialized).not.toContain(sentinels.assistantId);
+    expect(allSerialized).not.toContain(sentinels.auth);
+    expect(allSerialized).not.toContain("SENTINEL-AUTH-TOKEN");
+    expect(allSerialized).not.toContain(sentinels.rawBody);
+    expect(allSerialized).not.toContain("BROKEN");
+    expect(allSerialized).not.toContain("telnyx_end_user_target");
+  });
+});
