@@ -1,7 +1,7 @@
 export { Counter } from "./counter";
 export { DayAgenda } from "./agenda-actor";
 import type { Counter } from "./counter";
-import type { DayAgenda } from "./agenda-actor";
+import type { AgendaNamespace } from "./agenda-binding";
 
 import {
   type ActorNamespace,
@@ -19,11 +19,6 @@ import { handleMcpRequest } from "./mcp-server";
 type CounterStub = ActorStub & Pick<Counter, "increment" | "read">;
 interface CounterNamespace extends ActorNamespace {
   idFromName(name: string, options?: IdFromNameOptions): CounterStub;
-}
-
-type AgendaStub = ActorStub & Pick<DayAgenda, "getOccupiedSlots" | "createBooking">;
-interface AgendaNamespace extends ActorNamespace {
-  idFromName(name: string, options?: IdFromNameOptions): AgendaStub;
 }
 
 interface Env {

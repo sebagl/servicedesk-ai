@@ -8,6 +8,10 @@ vi.mock("@telnyx/edge-runtime", () => ({
 
 import handler from "../src/index";
 import type { AppConfig } from "../src/config";
+import type {
+  CreateBookingInput,
+  CreateBookingResult,
+} from "../src/agenda-actor";
 
 const VALID_TOKEN = "mcp-test-token-value";
 
@@ -261,6 +265,7 @@ describe("/mcp — tools/list", () => {
     expect(body.result.tools.map((t) => t.name)).toEqual([
       "get_service_catalog",
       "get_availability",
+      "create_booking",
     ]);
   });
 });
@@ -731,5 +736,314 @@ describe("/mcp — tools/call get_availability", () => {
     };
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tools/call — create_booking
+// ---------------------------------------------------------------------------
+
+describe("/mcp — tools/call create_booking", () => {
+  // Pick a date within the 7-day booking window that lands on an open
+  // weekday (Mon–Fri in America/Mexico_City), so admission validation
+  // succeeds and createBooking reaches its success path.
+  function futureOpenDate(): string {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Mexico_City",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+    });
+    for (let i = 1; i <= 6; i++) {
+      const parts = fmt.formatToParts(new Date(Date.now() + i * 86_400_000));
+      const weekday = parts.find((p) => p.type === "weekday")!.value;
+      if (["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday)) {
+        const y = parts.find((p) => p.type === "year")!.value;
+        const m = parts.find((p) => p.type === "month")!.value;
+        const d = parts.find((p) => p.type === "day")!.value;
+        return `${y}-${m}-${d}`;
+      }
+    }
+    throw new Error("no open weekday within booking window");
+  }
+
+  type Handler = (
+    input: CreateBookingInput,
+  ) =>
+    | CreateBookingResult
+    | Error
+    | Promise<CreateBookingResult | Error>;
+
+  function bookingAgenda(handler: Handler) {
+    return {
+      idFromName: vi.fn(() => ({
+        createBooking: vi.fn(async (input: CreateBookingInput) => {
+          const result = await handler(input);
+          if (result instanceof Error) throw result;
+          return result;
+        }),
+      })),
+    };
+  }
+
+  const BASE_ARGS = () => {
+    const date = futureOpenDate();
+    return {
+      service_id: "oil_change",
+      date,
+      time: "10:00",
+      customer_name: "Alice",
+      customer_phone: "+5215512345678",
+      confirmed: true,
+    };
+  };
+
+  function callBooking(env: unknown, id: number, arguments_: unknown): Promise<Response> {
+    return handler.fetch(
+      mcpRequest(
+        jsonRpcBody(id, "tools/call", {
+          name: "create_booking",
+          arguments: arguments_,
+        }),
+        mcpHeaders(VALID_TOKEN),
+      ),
+      env as never,
+    );
+  }
+
+  it("success → confirmed response with booking_id, no PII in payload", async () => {
+    const captured: CreateBookingInput[] = [];
+    const agenda = bookingAgenda((input) => {
+      captured.push(input);
+      return {
+        ok: true,
+        booking_id: "bid-1",
+        service_id: input.service_id,
+        date: input.date,
+        time: input.time,
+        status: "confirmed",
+      };
+    });
+    const kv = validKv(VALID_CONFIG);
+    const args = BASE_ARGS();
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      args,
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError?: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBeFalsy();
+    const parsed = JSON.parse(body.result.content[0]!.text) as {
+      status: string;
+      booking_id: string;
+      service_id: string;
+      date: string;
+      time: string;
+    };
+    expect(parsed).toEqual({
+      status: "confirmed",
+      booking_id: "bid-1",
+      service_id: "oil_change",
+      date: args.date,
+      time: "10:00",
+    });
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.service_id).toBe("oil_change");
+    expect(captured[0]!.date).toBe(args.date);
+    expect(captured[0]!.time).toBe("10:00");
+    expect(captured[0]!.confirmed).toBe(true);
+  });
+
+  it("identical retry produces the same idempotency_key passed to the Actor", async () => {
+    const captured: CreateBookingInput[] = [];
+    const agenda = bookingAgenda((input) => {
+      captured.push(input);
+      return {
+        ok: true,
+        booking_id: "bid-1",
+        service_id: input.service_id,
+        date: input.date,
+        time: input.time,
+        status: "confirmed",
+      };
+    });
+    const kv = validKv(VALID_CONFIG);
+    const args = BASE_ARGS();
+
+    await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      args,
+    );
+    await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      2,
+      args,
+    );
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.idempotency_key).toBe(captured[1]!.idempotency_key);
+    expect(captured[0]!.idempotency_key).toMatch(/^mcp-[0-9a-f]{64}$/);
+  });
+
+  it("different time produces a different idempotency_key", async () => {
+    const captured: CreateBookingInput[] = [];
+    const agenda = bookingAgenda((input) => {
+      captured.push(input);
+      return {
+        ok: true,
+        booking_id: "bid-1",
+        service_id: input.service_id,
+        date: input.date,
+        time: input.time,
+        status: "confirmed",
+      };
+    });
+    const kv = validKv(VALID_CONFIG);
+    const a = BASE_ARGS();
+
+    await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      a,
+    );
+    await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      2,
+      { ...a, time: "11:00" },
+    );
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.idempotency_key).not.toBe(captured[1]!.idempotency_key);
+    expect(captured[0]!.time).toBe("10:00");
+    expect(captured[1]!.time).toBe("11:00");
+  });
+
+  it("slot_unavailable → isError with the domain code", async () => {
+    const agenda = bookingAgenda(() => ({
+      ok: false,
+      code: "slot_unavailable",
+    }));
+    const kv = validKv(VALID_CONFIG);
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      BASE_ARGS(),
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "slot_unavailable" }),
+    );
+  });
+
+  it("infra error → service_unavailable isError", async () => {
+    const agenda = bookingAgenda(() => {
+      throw new Error("actor down");
+    });
+    const kv = validKv(VALID_CONFIG);
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      BASE_ARGS(),
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+
+  it("rejects unexpected arguments (e.g. idempotency_key) via SDK invalid params", async () => {
+    const captured: CreateBookingInput[] = [];
+    const agenda = bookingAgenda((input) => {
+      captured.push(input);
+      return {
+        ok: true,
+        booking_id: "bid-1",
+        service_id: input.service_id,
+        date: input.date,
+        time: input.time,
+        status: "confirmed",
+      };
+    });
+    const kv = validKv(VALID_CONFIG);
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      { ...BASE_ARGS(), idempotency_key: "caller-supplied-key" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toMatch(/-32602/);
+    expect(captured).toHaveLength(0);
+  });
+
+  it("success result never contains customer name or phone", async () => {
+    const agenda = bookingAgenda((input) => ({
+      ok: true,
+      booking_id: "bid-1",
+      service_id: input.service_id,
+      date: input.date,
+      time: input.time,
+      status: "confirmed",
+    }));
+    const kv = validKv(VALID_CONFIG);
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      {
+        ...BASE_ARGS(),
+        customer_name: "Alice Smith",
+        customer_phone: "+5215512345678",
+      },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError?: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0]!.text;
+    expect(text).not.toContain("Alice");
+    expect(text).not.toContain("Smith");
+    expect(text).not.toContain("+5215512345678");
+    expect(text).not.toContain("customer_name");
+    expect(text).not.toContain("customer_phone");
   });
 });
