@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("@telnyx/edge-runtime", () => ({
   StatefulActor: class {
@@ -1045,5 +1045,120 @@ describe("/mcp — tools/call create_booking", () => {
     expect(text).not.toContain("+5215512345678");
     expect(text).not.toContain("customer_name");
     expect(text).not.toContain("customer_phone");
+  });
+
+  // --- mcp.tool_call log never contains customer data -------------------
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  it("mcp.tool_call log line carries no customer name, phone, or args", async () => {
+    const agenda = bookingAgenda(() => ({
+      ok: true,
+      booking_id: "bid-1",
+      service_id: "oil_change",
+      date: "2099-01-15",
+      time: "10:00",
+      status: "confirmed",
+    }));
+    const kv = validKv(VALID_CONFIG);
+
+    await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      {
+        ...BASE_ARGS(),
+        customer_name: "Alice Smith",
+        customer_phone: "+5215512345678",
+      },
+    );
+
+    const ev = logSpy.mock.calls
+      .map((call) => call[0])
+      .filter((s): s is string => typeof s === "string")
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .find((e) => e.event === "mcp.tool_call");
+    expect(ev).toBeDefined();
+    expect(ev!.tool).toBe("create_booking");
+    expect(ev!.outcome).toBe("ok");
+    expect(typeof ev!.latency_ms).toBe("number");
+    const serialized = JSON.stringify(ev);
+    expect(serialized).not.toContain("Alice");
+    expect(serialized).not.toContain("Smith");
+    expect(serialized).not.toContain("+5215512345678");
+    expect(serialized).not.toContain("customer_name");
+    expect(serialized).not.toContain("customer_phone");
+  });
+});
+
+describe("/mcp — correlation id and rejection logging", () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  function events(name: string): Array<Record<string, unknown>> {
+    return logSpy.mock.calls
+      .map((call) => call[0])
+      .filter((s): s is string => typeof s === "string")
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .filter((e) => e.event === name);
+  }
+
+  function catalogCall(extra: Record<string, string>): Request {
+    return mcpRequest(
+      jsonRpcBody(1, "tools/call", { name: "get_service_catalog", arguments: {} }),
+      mcpHeaders(VALID_TOKEN, extra),
+    );
+  }
+
+  it("logs a valid x-call-control-id on the tool-call line", async () => {
+    await handler.fetch(
+      catalogCall({ "x-call-control-id": "v3:abc_DEF-123" }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = events("mcp.tool_call");
+    expect(ev?.call_control_id).toBe("v3:abc_DEF-123");
+  });
+
+  it("ignores a malformed correlation header instead of logging it", async () => {
+    await handler.fetch(
+      catalogCall({ "x-call-control-id": "bad value {\"event\":\"forged\"}" }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = events("mcp.tool_call");
+    expect(ev?.call_control_id).toBe("");
+  });
+
+  it("logs the rejection reason without the credential", async () => {
+    await handler.fetch(
+      mcpRequest(jsonRpcBody(1, "tools/list"), mcpHeaders("wrong-token")),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = events("mcp.rejected");
+    expect(ev?.reason).toBe("invalid_bearer");
+    expect(JSON.stringify(ev)).not.toContain("wrong-token");
+  });
+
+  it("logs origin_header when a browser Origin is present", async () => {
+    await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/list"),
+        mcpHeaders(VALID_TOKEN, { origin: "https://example.com" }),
+      ),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    expect(events("mcp.rejected")[0]?.reason).toBe("origin_header");
   });
 });

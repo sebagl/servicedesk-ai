@@ -37,7 +37,7 @@ export type BookingResponse =
   | { status: 413; body: { error: "payload_too_large" } }
   | { status: 503; body: { error: "service_unavailable" } };
 
-async function readBoundedBody(
+export async function readBoundedBody(
   req: Request,
 ): Promise<
   | { ok: true; text: string }

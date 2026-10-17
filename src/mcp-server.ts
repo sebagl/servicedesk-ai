@@ -9,6 +9,7 @@ import { getAvailability } from "./availability";
 import { createBooking, type BookingServiceDeps } from "./booking-service";
 import { isValidDate } from "./scheduling";
 import type { AgendaNamespace } from "./agenda-binding";
+import { logEvent } from "./logger";
 
 const SERVICE_INFO = { name: "servicedesk-ai", version: "0.0.0" } as const;
 
@@ -44,6 +45,7 @@ const TOOL_ERROR_TEXT = "service_unavailable";
 function registerGetServiceCatalog(
   server: McpServer,
   kv: KvNamespace | undefined,
+  callId: string,
 ): void {
   server.registerTool(
     "get_service_catalog",
@@ -53,14 +55,15 @@ function registerGetServiceCatalog(
       inputSchema: GET_SERVICE_CATALOG_INPUT,
     },
     async () => {
+      const start = Date.now();
       if (kv === undefined) {
-        return toolError();
+        return logToolResult("get_service_catalog", callId, start, toolError());
       }
       const result = await loadConfig(kv);
       if (!result.ok) {
-        return toolError();
+        return logToolResult("get_service_catalog", callId, start, toolError());
       }
-      return {
+      return logToolResult("get_service_catalog", callId, start, {
         content: [
           {
             type: "text" as const,
@@ -70,7 +73,7 @@ function registerGetServiceCatalog(
             }),
           },
         ],
-      };
+      });
     },
   );
 }
@@ -91,6 +94,47 @@ function toolError(code?: string): {
   };
 }
 
+// Classify a tool result into the outcome label emitted to the structured
+// log. Success → "ok"; domain errors carry the error code; missing bindings
+// and infra failures collapse to "service_unavailable". Never derives the
+// outcome from anything that could include tool arguments or PII.
+function classifyToolOutcome(result: unknown): string {
+  if (typeof result !== "object" || result === null) return "ok";
+  const r = result as { isError?: unknown; content?: unknown };
+  if (r.isError !== true) return "ok";
+  const content = Array.isArray(r.content) ? r.content : [];
+  const text =
+    typeof content[0] === "object" &&
+    content[0] !== null &&
+    typeof (content[0] as { text?: unknown }).text === "string"
+      ? ((content[0] as { text: string }).text)
+      : "";
+  if (text === TOOL_ERROR_TEXT) return "service_unavailable";
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown };
+    return typeof parsed.error === "string"
+      ? parsed.error
+      : "service_unavailable";
+  } catch {
+    return "service_unavailable";
+  }
+}
+
+function logToolResult<T>(
+  tool: string,
+  callId: string,
+  start: number,
+  result: T,
+): T {
+  logEvent("mcp.tool_call", {
+    tool,
+    call_control_id: callId,
+    outcome: classifyToolOutcome(result),
+    latency_ms: Date.now() - start,
+  });
+  return result;
+}
+
 // `get_availability` — read-only, returns open appointment times for one date.
 // Reuses loadConfig + getAvailability so the same validation, fail-closed
 // semantics, and Actor occupancy check apply. Tool-handler failures never
@@ -100,6 +144,7 @@ function registerGetAvailability(
   server: McpServer,
   config: KvNamespace | undefined,
   agenda: AgendaNamespace | undefined,
+  callId: string,
 ): void {
   server.registerTool(
     "get_availability",
@@ -109,15 +154,21 @@ function registerGetAvailability(
       inputSchema: GET_AVAILABILITY_INPUT,
     },
     async (args: { date: string }) => {
+      const start = Date.now();
       if (!isValidDate(args.date)) {
-        return toolError("date_invalid");
+        return logToolResult(
+          "get_availability",
+          callId,
+          start,
+          toolError("date_invalid"),
+        );
       }
       if (config === undefined || agenda === undefined) {
-        return toolError();
+        return logToolResult("get_availability", callId, start, toolError());
       }
       const cfgResult = await loadConfig(config);
       if (!cfgResult.ok) {
-        return toolError();
+        return logToolResult("get_availability", callId, start, toolError());
       }
       const result = await getAvailability(
         args.date,
@@ -130,11 +181,16 @@ function registerGetAvailability(
           result.kind === "date_invalid" ||
           result.kind === "date_out_of_range"
         ) {
-          return toolError(result.kind);
+          return logToolResult(
+            "get_availability",
+            callId,
+            start,
+            toolError(result.kind),
+          );
         }
-        return toolError();
+        return logToolResult("get_availability", callId, start, toolError());
       }
-      return {
+      return logToolResult("get_availability", callId, start, {
         content: [
           {
             type: "text" as const,
@@ -148,7 +204,7 @@ function registerGetAvailability(
             }),
           },
         ],
-      };
+      });
     },
   );
 }
@@ -165,6 +221,7 @@ function registerCreateBooking(
   server: McpServer,
   config: KvNamespace | undefined,
   agenda: AgendaNamespace | undefined,
+  callId: string,
 ): void {
   server.registerTool(
     "create_booking",
@@ -181,8 +238,9 @@ function registerCreateBooking(
       customer_phone: string;
       confirmed: boolean;
     }) => {
+      const start = Date.now();
       if (config === undefined || agenda === undefined) {
-        return toolError();
+        return logToolResult("create_booking", callId, start, toolError());
       }
 
       // Deterministic, server-side idempotency key over the request fields
@@ -221,7 +279,7 @@ function registerCreateBooking(
       );
 
       if (result.kind === "confirmed") {
-        return {
+        return logToolResult("create_booking", callId, start, {
           content: [
             {
               type: "text" as const,
@@ -234,12 +292,12 @@ function registerCreateBooking(
               }),
             },
           ],
-        };
+        });
       }
       if (result.kind === "rejected") {
-        return toolError(result.code);
+        return logToolResult("create_booking", callId, start, toolError(result.code));
       }
-      return toolError();
+      return logToolResult("create_booking", callId, start, toolError());
     },
   );
 }
@@ -247,6 +305,10 @@ function registerCreateBooking(
 export interface McpDeps {
   config?: KvNamespace;
   agenda?: AgendaNamespace;
+  // Optional caller-supplied correlation id (e.g. the Telnyx call_control_id
+  // forwarded as a header), logged so a call can be traced across webhook
+  // and tool calls. Never used for authorization or business logic.
+  callId?: string;
 }
 
 // One server + one transport per request. No shared session state across
@@ -262,9 +324,9 @@ export async function handleMcpRequest(
     enableJsonResponse: true,
   });
 
-  registerGetServiceCatalog(server, deps.config);
-  registerGetAvailability(server, deps.config, deps.agenda);
-  registerCreateBooking(server, deps.config, deps.agenda);
+  registerGetServiceCatalog(server, deps.config, deps.callId ?? "");
+  registerGetAvailability(server, deps.config, deps.agenda, deps.callId ?? "");
+  registerCreateBooking(server, deps.config, deps.agenda, deps.callId ?? "");
 
   try {
     await server.connect(transport);

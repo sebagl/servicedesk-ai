@@ -1962,3 +1962,19 @@ Date: 2026-10-16. Executed manually by the user against the deployed function.
   sends an `Origin` header (rejected with 404 by this MVP).
 - `get_availability` and `create_booking` tools (not implemented yet).
 - Structured logging for `/mcp` (not implemented yet).
+
+## 3.3 — Remote MCP create_booking and replay (manual user execution)
+
+Date: 2026-10-16. Executed manually by the user against the deployed `/mcp` endpoint.
+
+| Check | Request | Result |
+|---|---|---|
+| New booking | `create_booking` tire_rotation, 2026-10-21 15:00, confirmed=true | confirmed, booking_id `94975cf1-a9d9-4921-adef-0f3accb33732` |
+| Identical retry | same arguments | confirmed, same booking_id (no duplicate) |
+| Occupancy | `get_availability` 2026-10-21 | 15:00 absent; 7 other slots available |
+
+Verified: server-derived idempotency key (sha256 of phone|date|time|service) makes
+assistant retries safe; the result never includes customer name or phone; the booking
+persisted in the DayAgenda Actor (`main-2026-10-21`).
+
+Synthetic test data only (`+15550000001`, "Test Caller").
