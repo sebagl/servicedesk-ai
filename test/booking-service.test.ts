@@ -205,6 +205,17 @@ describe("createBooking service", () => {
       expect(result).toEqual({ kind: "infrastructure_error" });
     });
 
+    it("actor response is an array → infrastructure_error", async () => {
+      const { deps } = makeDeps({
+        getAgenda: () => ({
+          createBooking: async () =>
+            [1, 2, 3] as unknown as CreateBookingResult,
+        }),
+      });
+      const result = await createBooking(VALID_REQUEST, deps);
+      expect(result).toEqual({ kind: "infrastructure_error" });
+    });
+
     it("actor response missing 'ok' → infrastructure_error", async () => {
       const { deps } = makeDeps({
         getAgenda: () => ({
@@ -233,6 +244,60 @@ describe("createBooking service", () => {
       expect(result).toEqual({ kind: "infrastructure_error" });
     });
 
+    it("success response with mismatched service_id → infrastructure_error", async () => {
+      const { deps } = makeDeps({
+        getAgenda: () => ({
+          createBooking: async () =>
+            ({
+              ok: true,
+              booking_id: "b-1",
+              service_id: "tire_rotation",
+              date: "2026-10-20",
+              time: "10:00",
+              status: "confirmed",
+            }) as unknown as CreateBookingResult,
+        }),
+      });
+      const result = await createBooking(VALID_REQUEST, deps);
+      expect(result).toEqual({ kind: "infrastructure_error" });
+    });
+
+    it("success response with mismatched date → infrastructure_error", async () => {
+      const { deps } = makeDeps({
+        getAgenda: () => ({
+          createBooking: async () =>
+            ({
+              ok: true,
+              booking_id: "b-1",
+              service_id: "oil_change",
+              date: "2026-10-21",
+              time: "10:00",
+              status: "confirmed",
+            }) as unknown as CreateBookingResult,
+        }),
+      });
+      const result = await createBooking(VALID_REQUEST, deps);
+      expect(result).toEqual({ kind: "infrastructure_error" });
+    });
+
+    it("success response with mismatched time → infrastructure_error", async () => {
+      const { deps } = makeDeps({
+        getAgenda: () => ({
+          createBooking: async () =>
+            ({
+              ok: true,
+              booking_id: "b-1",
+              service_id: "oil_change",
+              date: "2026-10-20",
+              time: "11:00",
+              status: "confirmed",
+            }) as unknown as CreateBookingResult,
+        }),
+      });
+      const result = await createBooking(VALID_REQUEST, deps);
+      expect(result).toEqual({ kind: "infrastructure_error" });
+    });
+
     it("success response with non-string booking_id → infrastructure_error", async () => {
       const { deps } = makeDeps({
         getAgenda: () => ({
@@ -240,6 +305,42 @@ describe("createBooking service", () => {
             ({
               ok: true,
               booking_id: 42,
+              service_id: "oil_change",
+              date: "2026-10-20",
+              time: "10:00",
+              status: "confirmed",
+            }) as unknown as CreateBookingResult,
+        }),
+      });
+      const result = await createBooking(VALID_REQUEST, deps);
+      expect(result).toEqual({ kind: "infrastructure_error" });
+    });
+
+    it("success response with empty booking_id → infrastructure_error", async () => {
+      const { deps } = makeDeps({
+        getAgenda: () => ({
+          createBooking: async () =>
+            ({
+              ok: true,
+              booking_id: "",
+              service_id: "oil_change",
+              date: "2026-10-20",
+              time: "10:00",
+              status: "confirmed",
+            }) as unknown as CreateBookingResult,
+        }),
+      });
+      const result = await createBooking(VALID_REQUEST, deps);
+      expect(result).toEqual({ kind: "infrastructure_error" });
+    });
+
+    it("success response with whitespace-only booking_id → infrastructure_error", async () => {
+      const { deps } = makeDeps({
+        getAgenda: () => ({
+          createBooking: async () =>
+            ({
+              ok: true,
+              booking_id: "   \t\n",
               service_id: "oil_change",
               date: "2026-10-20",
               time: "10:00",

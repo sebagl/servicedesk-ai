@@ -102,6 +102,7 @@ export async function createBooking(
   if (
     typeof actorResult !== "object" ||
     actorResult === null ||
+    Array.isArray(actorResult) ||
     typeof actorResult.ok !== "boolean"
   ) {
     return { kind: "infrastructure_error" };
@@ -115,11 +116,18 @@ export async function createBooking(
       time: unknown;
       status: unknown;
     };
+    // Echoed fields must round-trip exactly with the request: a mismatch would
+    // mean the Actor is acting on a different booking than we asked for, so we
+    // fail closed rather than surface a fabricated success.
     if (
       typeof r.booking_id !== "string" ||
+      r.booking_id.trim().length === 0 ||
       typeof r.service_id !== "string" ||
+      r.service_id !== req.service_id ||
       typeof r.date !== "string" ||
+      r.date !== req.date ||
       typeof r.time !== "string" ||
+      r.time !== req.time ||
       r.status !== "confirmed"
     ) {
       return { kind: "infrastructure_error" };

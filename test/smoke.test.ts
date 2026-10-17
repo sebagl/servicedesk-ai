@@ -421,6 +421,36 @@ describe("config route — invalid schema → 503", () => {
     const res = await getWithConfig(bad);
     expect(res.status).toBe(503);
   });
+
+  it("wrong location_id rejected → 503", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, location_id: "downtown" },
+    };
+    const res = await getWithConfig(bad);
+    expect(res.status).toBe(503);
+  });
+
+  it("unknown weekday rejected → 503", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, open_days: ["mon", "funday"] },
+    };
+    const res = await getWithConfig(bad);
+    expect(res.status).toBe(503);
+  });
+
+  it("duplicate weekday rejected → 503", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["mon", "tue", "mon"],
+      },
+    };
+    const res = await getWithConfig(bad);
+    expect(res.status).toBe(503);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -481,6 +511,102 @@ describe("loadConfig — direct unit tests", () => {
     };
     const result = await loadConfig(validKv(dup) as never);
     expect(result.ok).toBe(false);
+  });
+
+  it("wrong location_id → not ok", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, location_id: "downtown" },
+    };
+    const result = await loadConfig(validKv(bad) as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it("empty location_id rejected → not ok", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, location_id: "" },
+    };
+    const result = await loadConfig(validKv(bad) as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it("unknown weekday in open_days → not ok", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, open_days: ["mon", "funday"] },
+    };
+    const result = await loadConfig(validKv(bad) as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it("weekday with wrong casing → not ok", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, open_days: ["Mon", "Tue"] },
+    };
+    const result = await loadConfig(validKv(bad) as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it("duplicate weekday in open_days → not ok", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["mon", "tue", "mon"],
+      },
+    };
+    const result = await loadConfig(validKv(bad) as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it("empty open_days → not ok", async () => {
+    const bad = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, open_days: [] },
+    };
+    const result = await loadConfig(validKv(bad) as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it("single weekday subset is accepted", async () => {
+    const ok = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, open_days: ["mon"] },
+    };
+    const result = await loadConfig(validKv(ok) as never);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.config.business.open_days).toEqual(["mon"]);
+    }
+  });
+
+  it("weekend-only subset is accepted", async () => {
+    const ok = {
+      ...VALID_CONFIG,
+      business: { ...VALID_CONFIG.business, open_days: ["sat", "sun"] },
+    };
+    const result = await loadConfig(validKv(ok) as never);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.config.business.open_days).toEqual(["sat", "sun"]);
+    }
+  });
+
+  it("non-contiguous weekday subset is accepted", async () => {
+    const ok = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["mon", "wed", "fri"],
+      },
+    };
+    const result = await loadConfig(validKv(ok) as never);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.config.business.open_days).toEqual(["mon", "wed", "fri"]);
+    }
   });
 });
 

@@ -131,6 +131,7 @@ describe("/webhooks/dynamic-variables — shape", () => {
     expect(body.dynamic_variables.booking_enabled).toBe("false");
     expect(body.dynamic_variables.system_status).toBe("degraded");
     expect(body.dynamic_variables.service_list).toBe("");
+    expect(body.dynamic_variables.business_hours).toBe("");
   });
 
   it("invalid JSON → 400", async () => {
@@ -159,6 +160,134 @@ describe("/webhooks/dynamic-variables — shape", () => {
       dynamic_variables: Record<string, string>;
     };
     expect(body.dynamic_variables.system_status).toBe("ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// business_hours announcement — driven by the validated config
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — business_hours announcement", () => {
+  it("non-contiguous open_days → comma-separated day names in Monday–Sunday order", async () => {
+    const config: AppConfig = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["mon", "wed", "fri"],
+      },
+    };
+    const env = { CONFIG: validKv(config) };
+    const res = await handler.fetch(
+      webhookReq(initPayload("+15550000010")),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.business_hours).toBe(
+      "Monday, Wednesday, Friday, 09:00-17:00, last appointment 16:00 (America/Mexico_City)",
+    );
+  });
+
+  it("input open_days in a different order is presented in Monday–Sunday order", async () => {
+    const config: AppConfig = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["fri", "mon", "wed"],
+      },
+    };
+    const env = { CONFIG: validKv(config) };
+    const res = await handler.fetch(
+      webhookReq(initPayload("+15550000011")),
+      env as never,
+    );
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.business_hours).toBe(
+      "Monday, Wednesday, Friday, 09:00-17:00, last appointment 16:00 (America/Mexico_City)",
+    );
+  });
+
+  it("contiguous weekend range → 'Saturday to Sunday'", async () => {
+    const config: AppConfig = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["sat", "sun"],
+      },
+    };
+    const env = { CONFIG: validKv(config) };
+    const res = await handler.fetch(
+      webhookReq(initPayload("+15550000012")),
+      env as never,
+    );
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.business_hours).toBe(
+      "Saturday to Sunday, 09:00-17:00, last appointment 16:00 (America/Mexico_City)",
+    );
+  });
+
+  it("single weekday → just that day's name", async () => {
+    const config: AppConfig = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["wed"],
+      },
+    };
+    const env = { CONFIG: validKv(config) };
+    const res = await handler.fetch(
+      webhookReq(initPayload("+15550000013")),
+      env as never,
+    );
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.business_hours).toBe(
+      "Wednesday, 09:00-17:00, last appointment 16:00 (America/Mexico_City)",
+    );
+  });
+
+  it("CONFIG binding absent → degraded with empty business_hours", async () => {
+    const env = {} as never;
+    const res = await handler.fetch(
+      webhookReq(initPayload("+15550000014")),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.system_status).toBe("degraded");
+    expect(body.dynamic_variables.booking_enabled).toBe("false");
+    expect(body.dynamic_variables.business_hours).toBe("");
+  });
+
+  it("config with bad open_days is rejected → empty business_hours", async () => {
+    const bad: AppConfig = {
+      ...VALID_CONFIG,
+      business: {
+        ...VALID_CONFIG.business,
+        open_days: ["mon", "funday"],
+      },
+    };
+    const env = { CONFIG: validKv(bad) };
+    const res = await handler.fetch(
+      webhookReq(initPayload("+15550000015")),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.system_status).toBe("degraded");
+    expect(body.dynamic_variables.booking_enabled).toBe("false");
+    expect(body.dynamic_variables.business_hours).toBe("");
   });
 });
 
@@ -315,6 +444,7 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
     expect(body.dynamic_variables.system_status).toBe("degraded");
     expect(body.dynamic_variables.booking_enabled).toBe("false");
     expect(body.dynamic_variables.service_list).toBe("");
+    expect(body.dynamic_variables.business_hours).toBe("");
     const ev = findEvent("webhook.dynamic_variables");
     expect(ev?.config_outcome).toBe("timeout");
   });
@@ -507,5 +637,166 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     expect(allSerialized).not.toContain(sentinels.rawBody);
     expect(allSerialized).not.toContain("BROKEN");
     expect(allSerialized).not.toContain("telnyx_end_user_target");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// call_control_id / assistant_id validation — only a bounded safe charset
+// (^[A-Za-z0-9:_-]{1,128}$) reaches the structured log. Anything else is
+// dropped to "" so an unauthenticated webhook payload cannot inject text,
+// whitespace, or control bytes into runtime logs.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — id validation", () => {
+  function payloadWithIds(
+    callControlId: unknown,
+    assistantId: unknown,
+  ): string {
+    return JSON.stringify({
+      data: {
+        event_type: "assistant.initialization",
+        payload: {
+          telnyx_end_user_target: "+15550000020",
+          call_control_id: callControlId,
+          assistant_id: assistantId,
+        },
+      },
+    });
+  }
+
+  it("preserves valid ids that match the bounded charset", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(payloadWithIds("cc-abc-123", "asst-xyz")),
+      env as never,
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe("cc-abc-123");
+    expect(ev?.assistant_id).toBe("asst-xyz");
+  });
+
+  it("preserves valid ids at the 128-char boundary", async () => {
+    const id128 = "a".repeat(128);
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(payloadWithIds(id128, id128)),
+      env as never,
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe(id128);
+    expect(ev?.assistant_id).toBe(id128);
+  });
+
+  it("replaces oversized ids (>128 chars) with empty string", async () => {
+    const id129 = "a".repeat(129);
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const res = await handler.fetch(
+      webhookReq(payloadWithIds(id129, id129)),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe("");
+    expect(ev?.assistant_id).toBe("");
+    const serialized = JSON.stringify(logEvents());
+    expect(serialized).not.toContain(id129);
+  });
+
+  it("replaces whitespace and control characters with empty string", async () => {
+    const bad = "cc with spaces\ncc\tctrl";
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(payloadWithIds(bad, bad)),
+      env as never,
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe("");
+    expect(ev?.assistant_id).toBe("");
+    const serialized = JSON.stringify(logEvents());
+    expect(serialized).not.toContain("cc with spaces");
+    expect(serialized).not.toContain("cc\tctrl");
+  });
+
+  it("replaces email-like values with empty string", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(payloadWithIds("attacker@example.com", "asst@evil.com")),
+      env as never,
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe("");
+    expect(ev?.assistant_id).toBe("");
+    const serialized = JSON.stringify(logEvents());
+    expect(serialized).not.toContain("attacker@example.com");
+    expect(serialized).not.toContain("asst@evil.com");
+    expect(serialized).not.toContain("@");
+  });
+
+  it("replaces non-string values (number, object) with empty string", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(payloadWithIds(12345, { nested: "object" })),
+      env as never,
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe("");
+    expect(ev?.assistant_id).toBe("");
+    const serialized = JSON.stringify(logEvents());
+    expect(serialized).not.toContain("nested");
+    expect(serialized).not.toContain("object");
+  });
+
+  it("replaces null ids with empty string", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(payloadWithIds(null, null)),
+      env as never,
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.call_control_id).toBe("");
+    expect(ev?.assistant_id).toBe("");
+  });
+
+  it("invalid sentinel values appear nowhere in captured logs or response", async () => {
+    const sentinels = {
+      callControlId: "cc-attacker@evil.com with spaces\nline2",
+      assistantId: "asst\u0000null-byte\u0007bell",
+    };
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const res = await handler.fetch(
+      webhookReq(payloadWithIds(sentinels.callControlId, sentinels.assistantId)),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, unknown>;
+    };
+    const responseSerialized = JSON.stringify(body);
+    expect(responseSerialized).not.toContain("attacker@evil.com");
+    expect(responseSerialized).not.toContain("with spaces");
+    expect(responseSerialized).not.toContain("line2");
+    expect(responseSerialized).not.toContain("null-byte");
+    expect(responseSerialized).not.toContain("bell");
+
+    const allLogs = JSON.stringify(logEvents());
+    expect(allLogs).not.toContain("attacker@evil.com");
+    expect(allLogs).not.toContain("with spaces");
+    expect(allLogs).not.toContain("line2");
+    expect(allLogs).not.toContain("null-byte");
+    expect(allLogs).not.toContain("bell");
+    expect(allLogs).not.toContain("\u0000");
+    expect(allLogs).not.toContain("\u0007");
+  });
+
+  it("valid request still produces exactly one webhook.dynamic_variables event", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    await handler.fetch(
+      webhookReq(initPayload("+15550000030")),
+      env as never,
+    );
+    const events = logEvents().filter(
+      (e) => e.event === "webhook.dynamic_variables",
+    );
+    expect(events).toHaveLength(1);
   });
 });

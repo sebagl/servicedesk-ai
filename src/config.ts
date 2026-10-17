@@ -1,5 +1,12 @@
 import type { KvNamespace } from "@telnyx/edge-runtime";
 
+import {
+  LOCATION_ID,
+  TIMEZONE,
+  SLOT_HOURS,
+  BOOKING_WINDOW_DAYS,
+} from "./domain/business-rules";
+
 export interface Service {
   id: string;
   name: string;
@@ -25,6 +32,16 @@ export type ConfigResult =
   | { ok: false };
 
 const CONFIG_KEY = "config/main";
+
+const VALID_WEEKDAYS = new Set([
+  "mon",
+  "tue",
+  "wed",
+  "thu",
+  "fri",
+  "sat",
+  "sun",
+]);
 
 function isString(v: unknown): v is string {
   return typeof v === "string";
@@ -52,16 +69,27 @@ function validateService(raw: unknown, ids: Set<string>): Service | null {
 function validateBusiness(raw: unknown): BusinessConfig | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
-  if (!isString(r.location_id) || r.location_id.length === 0) return null;
-  if (!isString(r.timezone) || r.timezone !== "America/Mexico_City") return null;
+  if (!isString(r.location_id) || r.location_id !== LOCATION_ID) return null;
+  if (!isString(r.timezone) || r.timezone !== TIMEZONE) return null;
   if (!Array.isArray(r.open_days) || r.open_days.length === 0) return null;
   if (!r.open_days.every(isString)) return null;
+  const seenDays = new Set<string>();
+  for (const day of r.open_days) {
+    if (!VALID_WEEKDAYS.has(day)) return null;
+    if (seenDays.has(day)) return null;
+    seenDays.add(day);
+  }
   if (typeof r.slot_hours !== "object" || r.slot_hours === null) return null;
   const sh = r.slot_hours as Record<string, unknown>;
-  if (!isString(sh.start) || sh.start !== "09:00") return null;
-  if (!isString(sh.end) || sh.end !== "17:00") return null;
-  if (!isString(sh.last_start) || sh.last_start !== "16:00") return null;
-  if (!isNumber(r.booking_window_days) || r.booking_window_days !== 7) return null;
+  if (!isString(sh.start) || sh.start !== SLOT_HOURS.start) return null;
+  if (!isString(sh.end) || sh.end !== SLOT_HOURS.end) return null;
+  if (!isString(sh.last_start) || sh.last_start !== SLOT_HOURS.last_start) return null;
+  if (
+    !isNumber(r.booking_window_days) ||
+    r.booking_window_days !== BOOKING_WINDOW_DAYS
+  ) {
+    return null;
+  }
   if (!isBoolean(r.booking_enabled)) return null;
   return {
     location_id: r.location_id,

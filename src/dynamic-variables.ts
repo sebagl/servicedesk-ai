@@ -19,6 +19,41 @@ const WEEKDAY_NAMES = [
   "Saturday",
 ] as const;
 
+const WEEKDAY_TOKENS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+type WeekdayToken = (typeof WEEKDAY_TOKENS)[number];
+
+const WEEKDAY_LONG: Record<WeekdayToken, string> = {
+  mon: "Monday",
+  tue: "Tuesday",
+  wed: "Wednesday",
+  thu: "Thursday",
+  fri: "Friday",
+  sat: "Saturday",
+  sun: "Sunday",
+};
+
+function formatBusinessHours(
+  openDays: readonly string[],
+  slotHours: { start: string; end: string; last_start: string },
+  timezone: string,
+): string {
+  const indices = openDays
+    .map((d) => WEEKDAY_TOKENS.indexOf(d as WeekdayToken))
+    .filter((i) => i >= 0)
+    .sort((a, b) => a - b);
+  if (indices.length === 0) return "";
+  const contiguous = indices.every(
+    (v, i) => i === 0 || v === indices[i - 1]! + 1,
+  );
+  const first = WEEKDAY_LONG[WEEKDAY_TOKENS[indices[0]!]!];
+  const last = WEEKDAY_LONG[WEEKDAY_TOKENS[indices[indices.length - 1]!]!];
+  const daysPart =
+    contiguous && indices.length > 1
+      ? `${first} to ${last}`
+      : indices.map((i) => WEEKDAY_LONG[WEEKDAY_TOKENS[i]!]).join(", ");
+  return `${daysPart}, ${slotHours.start}-${slotHours.end}, last appointment ${slotHours.last_start} (${timezone})`;
+}
+
 // Cap on how long the dynamic-variables webhook will wait for KV config. A
 // slow KV must not stall the 200 the caller expects at assistant init.
 const CONFIG_WAIT_MS = 800;
@@ -116,19 +151,24 @@ export async function handleDynamicVariables(
       ? (payload as Record<string, unknown>)
       : {};
 
-  const callControlId =
-    typeof payloadObj.call_control_id === "string"
-      ? payloadObj.call_control_id
-      : "";
+  // call_control_id and assistant_id arrive in an unauthenticated webhook
+  // payload; only a bounded safe charset is forwarded to the structured log so
+  // a hostile payload cannot inject newlines, control bytes, or arbitrary text
+  // into runtime logs.
+  const ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
+  function readSafeId(value: unknown): string {
+    return typeof value === "string" && ID_PATTERN.test(value) ? value : "";
+  }
+  const callControlId = readSafeId(payloadObj.call_control_id);
   const callerRaw =
     typeof payloadObj.telnyx_end_user_target === "string"
       ? payloadObj.telnyx_end_user_target
       : "";
-  const assistantId =
-    typeof payloadObj.assistant_id === "string" ? payloadObj.assistant_id : "";
+  const assistantId = readSafeId(payloadObj.assistant_id);
 
   let bookingEnabled = false;
   let serviceList = "";
+  let businessHours = "";
   let systemStatus = "ok";
   let configOutcome: "ok" | "timeout" | "load_failed" | "absent" = "ok";
   if (env.CONFIG === undefined) {
@@ -148,6 +188,11 @@ export async function handleDynamicVariables(
       serviceList = cfgResult.config.services
         .map((s) => s.name)
         .join(", ");
+      businessHours = formatBusinessHours(
+        cfgResult.config.business.open_days,
+        cfgResult.config.business.slot_hours,
+        cfgResult.config.business.timezone,
+      );
     }
   }
 
@@ -177,8 +222,7 @@ export async function handleDynamicVariables(
       today_local: todayLocal,
       today_weekday: weekday,
       now_local_time: `${hh}:${min}`,
-      business_hours:
-        "Monday to Friday, 09:00-17:00, last appointment 16:00 (America/Mexico_City)",
+      business_hours: businessHours,
       service_list: serviceList,
     },
   });
