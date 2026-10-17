@@ -18,6 +18,13 @@ type    = "Counter"
 binding = "AGENDA"
 type    = "DayAgenda"
 
+# Conversation Actor — one instance per trusted Telnyx conversation.
+# Coordinates booking attempts across dates; persists the one-booking-per-
+# conversation aggregate (booking-domain.md §10).
+[[actors]]
+binding = "CONVERSATION_BOOKING"
+type    = "ConversationBooking"
+
 # KV namespace for service catalog + business configuration.
 # Created via `telnyx-edge storage kv create --name servicedesk-ai-config`.
 # Not available in local `dev` — config loader fails closed (503) without it.

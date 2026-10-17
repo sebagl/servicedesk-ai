@@ -1,7 +1,9 @@
 export { Counter } from "./counter";
 export { DayAgenda } from "./agenda-actor";
+export { ConversationBooking } from "./conversation-actor";
 import type { Counter } from "./counter";
 import type { AgendaNamespace } from "./agenda-binding";
+import type { ConversationBooking as ConversationBookingActor } from "./conversation-actor";
 
 import {
   type ActorNamespace,
@@ -23,9 +25,15 @@ interface CounterNamespace extends ActorNamespace {
   idFromName(name: string, options?: IdFromNameOptions): CounterStub;
 }
 
+type ConversationBookingStub = ActorStub & Pick<ConversationBookingActor, "book">;
+interface ConversationBookingNamespace extends ActorNamespace {
+  idFromName(name: string, options?: IdFromNameOptions): ConversationBookingStub;
+}
+
 interface Env {
   COUNTER: CounterNamespace;
   AGENDA: AgendaNamespace;
+  CONVERSATION_BOOKING: ConversationBookingNamespace;
   SECRETS?: Secrets;
   CONFIG?: KvNamespace;
 }
@@ -119,6 +127,7 @@ export default {
       return handleMcpRequest(req, {
         config: env.CONFIG,
         agenda: env.AGENDA,
+        conversationBooking: env.CONVERSATION_BOOKING,
         callId: readCallId(req),
       });
     }

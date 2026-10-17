@@ -291,17 +291,25 @@ serialization — label real-runtime concurrency verification separately. `[C3]`
 
 ## 10. One booking per conversation
 
-> Status: **APPROVED policy, NOT IMPLEMENTED.** The existing MCP
-> content-derived `idempotency_key` remains the current implementation
-> until a future MCP subtask replaces it with this policy.
+> Status: **APPROVED policy, implemented locally, NOT YET DEPLOYED.**
+> The MCP route through `ConversationBooking` is exercised by mocked tests
+> against the local suite; it has not been shipped to the public URL.
+> The 2026-10-16 subtask 3.3 evidence refers to the old content-derived
+> `idempotency_key` and is preserved as historical, not as proof of the
+> current implementation.
 
 - MCP permits **at most one confirmed booking per trusted Telnyx conversation**.
-- Conversation identity is read from **SDK metadata**, never from tool
-  arguments.
-- Missing or invalid conversation identity **blocks `create_booking`**;
-  read tools (`get_service_catalog`, `get_availability`) remain usable.
-- A **conversation-scoped Actor** coordinates booking attempts across
-  different dates.
+- Conversation identity is read from **SDK metadata** (`params._meta`),
+  matched against `/^[A-Za-z0-9:_-]{1,128}$/`, and resolved to a stable
+  Actor name via SHA-256 — never from tool arguments or correlation
+  headers.
+- Missing or invalid conversation identity **blocks `create_booking`** with
+  `conversation_id_required`; read tools (`get_service_catalog`,
+  `get_availability`) remain usable without metadata.
+- A **conversation-scoped Actor** (`ConversationBooking`,
+  `conversation-{sha256(id)}`) coordinates booking attempts across
+  different dates, persisting one aggregate (`idle` / `pending` /
+  `confirmed`) per conversation.
 - `DayAgenda` (`main-{YYYY-MM-DD}`) remains the **authoritative** owner of
   slot occupancy and booking persistence.
 - Before calling `DayAgenda`, the conversation Actor **persists the pending
@@ -310,7 +318,7 @@ serialization — label real-runtime concurrency verification separately. `[C3]`
   It is resolved using the **same input and same key** before any changed
   request is admitted.
 - A **definitive domain rejection** (e.g. `slot_unavailable`, `time_invalid`)
-  permits a new corrected attempt.
+  permits a new corrected attempt with a fresh attempt key in the same call.
 - A confirmed **identical retry** returns the original result.
 - After confirmation, **changed input** returns `conversation_already_booked`
   and must **not** create, cancel, or reschedule anything.

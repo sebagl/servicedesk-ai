@@ -4,13 +4,19 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
-import type { KvNamespace } from "@telnyx/edge-runtime";
+import type {
+  ActorNamespace,
+  ActorStub,
+  IdFromNameOptions,
+  KvNamespace,
+} from "@telnyx/edge-runtime";
 
 import { loadConfig } from "./config";
 import { getAvailability } from "./availability";
-import { createBooking, type BookingServiceDeps } from "./booking-service";
 import { isValidDate } from "./scheduling";
 import type { AgendaNamespace } from "./agenda-binding";
+import type { ConversationBooking as ConversationBookingActor } from "./conversation-actor";
+import type { ConversationBookingResult } from "./conversation-booking";
 import { logEvent } from "./logger";
 
 const SERVICE_INFO = { name: "servicedesk-ai", version: "0.0.0" } as const;
@@ -276,18 +282,79 @@ function registerGetAvailability(
   );
 }
 
-// `create_booking` — write path. Derives a server-side idempotency_key from
-// the normalized request fields so callers cannot poison replay protection
-// and replays are deterministic. Routes through the existing createBooking
-// application service, so admission rules, replay-first semantics, and the
-// Actor's booking validation all apply unchanged. Tool-handler failures
-// never throw out — missing bindings, infrastructure errors, and rejected
-// domain codes all surface as MCP tool error results. Customer PII (name,
-// phone) never leaves the boundary in any response.
+// `create_booking` — write path. Routes through the conversation-scoped
+// StatefulActor (booking-domain.md §10): the Actor owns one-booking-per-
+// conversation and its own idempotency. Conversation identity is read from
+// SDK metadata only — never from tool arguments or correlation headers —
+// and resolved to a stable Actor name via SHA-256, so the same conversation
+// always lands on the same Actor regardless of date or time. The MCP layer
+// does not consult KV/AGENDA before calling: the Actor handles execution
+// and confirmed replays, and is the only place those bindings are touched.
+// Tool-handler failures never throw out — invalid metadata, missing
+// CONVERSATION_BOOKING binding, RPC lookup failures, and malformed Actor
+// results all collapse to a generic MCP tool error without exposing the
+// underlying exception. Customer PII (name, phone) never leaves the
+// boundary in any response.
+type ConversationBookingStub = ActorStub & Pick<ConversationBookingActor, "book">;
+interface ConversationBookingNamespace extends ActorNamespace {
+  idFromName(name: string, options?: IdFromNameOptions): ConversationBookingStub;
+}
+
+// Allowlisted rejection codes the MCP layer can echo back. Anything outside
+// this set — including unknown codes from a malformed Actor — collapses to
+// service_unavailable. conversation_already_booked is enforced by the
+// Actor; other codes propagate verbatim from the booking domain.
+const REJECTION_CODES: ReadonlySet<string> = new Set([
+  "unknown_service",
+  "date_out_of_range",
+  "date_not_open",
+  "time_invalid",
+  "confirmation_required",
+  "booking_disabled",
+  "slot_in_past",
+  "slot_unavailable",
+  "idempotency_key_conflict",
+  "conversation_already_booked",
+]);
+
+function isString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+// Strict validation of the Actor's confirmed result, with cross-field
+// correspondence to the request. A mismatch indicates the Actor returned
+// a record for a different booking attempt — collapse to malformed.
+function validateConfirmedResult(
+  raw: unknown,
+  expected: { service_id: string; date: string; time: string },
+): { booking_id: string; service_id: string; date: string; time: string } | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.kind !== "string" || r.kind !== "confirmed") return null;
+  if (!isString(r.booking_id)) return null;
+  if (!isString(r.service_id) || r.service_id !== expected.service_id) return null;
+  if (!isString(r.date) || r.date !== expected.date) return null;
+  if (!isString(r.time) || r.time !== expected.time) return null;
+  return {
+    booking_id: r.booking_id,
+    service_id: r.service_id,
+    date: r.date,
+    time: r.time,
+  };
+}
+
+// Stable Actor name for a conversation: SHA-256 over the validated
+// conversation id, prefixed with "conversation-". The same id always maps
+// to the same Actor instance for the lifetime of the deployment.
+function conversationActorName(conversationId: string): string {
+  return `conversation-${createHash("sha256")
+    .update(conversationId)
+    .digest("hex")}`;
+}
+
 function registerCreateBooking(
   server: McpServer,
-  config: KvNamespace | undefined,
-  agenda: AgendaNamespace | undefined,
+  conversationBooking: ConversationBookingNamespace | undefined,
   callId: string,
 ): void {
   server.registerTool(
@@ -307,7 +374,26 @@ function registerCreateBooking(
     }, extra) => {
       const start = Date.now();
       const conversationId = readConversationId(extra);
-      if (config === undefined || agenda === undefined) {
+
+      // Missing or invalid conversation identity blocks the write path
+      // before any infrastructure call — the request can never reach an
+      // Actor that would know what to do with it.
+      if (conversationId === undefined) {
+        return logToolResult(
+          "create_booking",
+          callId,
+          start,
+          toolError("conversation_id_required"),
+          conversationId,
+        );
+      }
+
+      // Valid metadata but no binding at all: this is a configuration
+      // defect, surfaced as generic service_unavailable. We never fall
+      // back to `conversation_id_required` here — that code is reserved
+      // for missing/invalid metadata and would mislead the caller about
+      // what to fix.
+      if (conversationBooking === undefined) {
         return logToolResult(
           "create_booking",
           callId,
@@ -317,42 +403,39 @@ function registerCreateBooking(
         );
       }
 
-      // Deterministic, server-side idempotency key over the request fields
-      // the user actually controls. The input schema is strict, so a
-      // caller-supplied idempotency_key is rejected rather than trusted.
-      const canonical =
-        `${args.customer_phone}|${args.date}|${args.time}|${args.service_id}`;
-      const idempotency_key = `mcp-${createHash("sha256")
-        .update(canonical)
-        .digest("hex")}`;
-
-      const serviceDeps: BookingServiceDeps = {
-        loadConfig: async () => {
-          const r = await loadConfig(config);
-          return r.ok ? r.config : null;
-        },
-        getAgenda: (name) => {
-          const stub = agenda.idFromName(name);
-          return {
-            createBooking: (input) => stub.createBooking(input),
-          };
-        },
-      };
-
-      const result = await createBooking(
-        {
+      // The Actor lookup and the RPC are both wrapped in one try/catch:
+      // any exception from idFromName() or from the book() call itself
+      // (binding missing at runtime, network failure, actor crash, etc.)
+      // is collapsed to a generic tool error. The raw exception never
+      // reaches the response or any log line.
+      let raw: ConversationBookingResult;
+      try {
+        const actorName = conversationActorName(conversationId);
+        const stub = conversationBooking.idFromName(actorName);
+        raw = await stub.book({
           service_id: args.service_id,
           date: args.date,
           time: args.time,
           customer_name: args.customer_name,
           customer_phone: args.customer_phone,
-          idempotency_key,
           confirmed: args.confirmed,
-        },
-        serviceDeps,
-      );
+        });
+      } catch {
+        return logToolResult(
+          "create_booking",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
+      }
 
-      if (result.kind === "confirmed") {
+      const validated = validateConfirmedResult(raw, {
+        service_id: args.service_id,
+        date: args.date,
+        time: args.time,
+      });
+      if (validated !== null) {
         return logToolResult(
           "create_booking",
           callId,
@@ -363,10 +446,10 @@ function registerCreateBooking(
                 type: "text" as const,
                 text: JSON.stringify({
                   status: "confirmed",
-                  booking_id: result.booking_id,
-                  service_id: result.service_id,
-                  date: result.date,
-                  time: result.time,
+                  booking_id: validated.booking_id,
+                  service_id: validated.service_id,
+                  date: validated.date,
+                  time: validated.time,
                 }),
               },
             ],
@@ -374,15 +457,27 @@ function registerCreateBooking(
           conversationId,
         );
       }
-      if (result.kind === "rejected") {
+
+      // Not confirmed — try to classify as a domain rejection. Anything
+      // malformed (unknown shape, unknown code) collapses to
+      // service_unavailable.
+      if (
+        typeof raw === "object" &&
+        raw !== null &&
+        !Array.isArray(raw) &&
+        (raw as { kind?: unknown }).kind === "rejected" &&
+        typeof (raw as { code?: unknown }).code === "string" &&
+        REJECTION_CODES.has((raw as { code: string }).code)
+      ) {
         return logToolResult(
           "create_booking",
           callId,
           start,
-          toolError(result.code),
+          toolError((raw as { code: string }).code),
           conversationId,
         );
       }
+
       return logToolResult(
         "create_booking",
         callId,
@@ -397,6 +492,7 @@ function registerCreateBooking(
 export interface McpDeps {
   config?: KvNamespace;
   agenda?: AgendaNamespace;
+  conversationBooking?: ConversationBookingNamespace;
   // Optional caller-supplied correlation id (e.g. the Telnyx call_control_id
   // forwarded as a header), logged so a call can be traced across webhook
   // and tool calls. Never used for authorization or business logic.
@@ -418,7 +514,7 @@ export async function handleMcpRequest(
 
   registerGetServiceCatalog(server, deps.config, deps.callId ?? "");
   registerGetAvailability(server, deps.config, deps.agenda, deps.callId ?? "");
-  registerCreateBooking(server, deps.config, deps.agenda, deps.callId ?? "");
+  registerCreateBooking(server, deps.conversationBooking, deps.callId ?? "");
 
   try {
     await server.connect(transport);

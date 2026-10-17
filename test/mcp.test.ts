@@ -9,9 +9,9 @@ vi.mock("@telnyx/edge-runtime", () => ({
 import handler from "../src/index";
 import type { AppConfig } from "../src/config";
 import type {
-  CreateBookingInput,
-  CreateBookingResult,
-} from "../src/agenda-actor";
+  ConversationBookingInput,
+  ConversationBookingResult,
+} from "../src/conversation-booking";
 
 const VALID_TOKEN = "mcp-test-token-value";
 
@@ -740,13 +740,31 @@ describe("/mcp — tools/call get_availability", () => {
 });
 
 // ---------------------------------------------------------------------------
-// tools/call — create_booking
+// tools/call — create_booking (conversation-scoped StatefulActor)
 // ---------------------------------------------------------------------------
 
 describe("/mcp — tools/call create_booking", () => {
-  // Pick a date within the 7-day booking window that lands on an open
-  // weekday (Mon–Fri in America/Mexico_City), so admission validation
-  // succeeds and createBooking reaches its success path.
+  type ActorHandler = (
+    input: ConversationBookingInput,
+  ) =>
+    | ConversationBookingResult
+    | Error
+    | Promise<ConversationBookingResult | Error>;
+
+  function conversationBookingActor(handler: ActorHandler) {
+    const stub = {
+      book: vi.fn(async (input: ConversationBookingInput) => {
+        const result = await handler(input);
+        if (result instanceof Error) throw result;
+        return result;
+      }),
+    };
+    return {
+      stub,
+      idFromName: vi.fn(() => stub),
+    };
+  }
+
   function futureOpenDate(): string {
     const fmt = new Intl.DateTimeFormat("en-US", {
       timeZone: "America/Mexico_City",
@@ -768,25 +786,6 @@ describe("/mcp — tools/call create_booking", () => {
     throw new Error("no open weekday within booking window");
   }
 
-  type Handler = (
-    input: CreateBookingInput,
-  ) =>
-    | CreateBookingResult
-    | Error
-    | Promise<CreateBookingResult | Error>;
-
-  function bookingAgenda(handler: Handler) {
-    return {
-      idFromName: vi.fn(() => ({
-        createBooking: vi.fn(async (input: CreateBookingInput) => {
-          const result = await handler(input);
-          if (result instanceof Error) throw result;
-          return result;
-        }),
-      })),
-    };
-  }
-
   const BASE_ARGS = () => {
     const date = futureOpenDate();
     return {
@@ -799,39 +798,53 @@ describe("/mcp — tools/call create_booking", () => {
     };
   };
 
-  function callBooking(env: unknown, id: number, arguments_: unknown): Promise<Response> {
+  function callBooking(
+    env: unknown,
+    id: number,
+    arguments_: unknown,
+    meta: unknown = undefined,
+  ): Promise<Response> {
+    const params: Record<string, unknown> = {
+      name: "create_booking",
+      arguments: arguments_,
+    };
+    if (meta !== undefined) params._meta = meta;
     return handler.fetch(
-      mcpRequest(
-        jsonRpcBody(id, "tools/call", {
-          name: "create_booking",
-          arguments: arguments_,
-        }),
-        mcpHeaders(VALID_TOKEN),
-      ),
+      mcpRequest(jsonRpcBody(id, "tools/call", params), mcpHeaders(VALID_TOKEN)),
       env as never,
     );
   }
 
-  it("success → confirmed response with booking_id, no PII in payload", async () => {
-    const captured: CreateBookingInput[] = [];
-    const agenda = bookingAgenda((input) => {
+  // The same conversation id always resolves to the same SHA-256-derived
+  // actor name, regardless of the booking date — that is the entire point
+  // of routing through the conversation-scoped StatefulActor.
+  const ACTOR_NAME_FOR = (conversationId: string): string => {
+    const { createHash } = require("node:crypto") as typeof import("node:crypto");
+    return `conversation-${createHash("sha256")
+      .update(conversationId)
+      .digest("hex")}`;
+  };
+
+  it("valid metadata → routes to actor and forwards only normalized booking args", async () => {
+    const captured: ConversationBookingInput[] = [];
+    const { stub, idFromName } = conversationBookingActor((input) => {
       captured.push(input);
       return {
-        ok: true,
+        kind: "confirmed",
         booking_id: "bid-1",
         service_id: input.service_id,
         date: input.date,
         time: input.time,
-        status: "confirmed",
       };
     });
-    const kv = validKv(VALID_CONFIG);
     const args = BASE_ARGS();
+    const conversationId = "conv-AZ_09";
 
     const res = await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       1,
       args,
+      { telnyx_conversation_id: conversationId },
     );
 
     expect(res.status).toBe(200);
@@ -856,87 +869,132 @@ describe("/mcp — tools/call create_booking", () => {
       date: args.date,
       time: "10:00",
     });
+
+    expect(idFromName).toHaveBeenCalledTimes(1);
+    expect(idFromName).toHaveBeenCalledWith(ACTOR_NAME_FOR(conversationId));
+
     expect(captured).toHaveLength(1);
-    expect(captured[0]!.service_id).toBe("oil_change");
-    expect(captured[0]!.date).toBe(args.date);
-    expect(captured[0]!.time).toBe("10:00");
-    expect(captured[0]!.confirmed).toBe(true);
+    const sent = captured[0]!;
+    expect(sent.service_id).toBe("oil_change");
+    expect(sent.date).toBe(args.date);
+    expect(sent.time).toBe("10:00");
+    expect(sent.customer_name).toBe("Alice");
+    expect(sent.customer_phone).toBe("+5215512345678");
+    expect(sent.confirmed).toBe(true);
+    // No idempotency_key or other transport-layer fields forwarded.
+    expect((sent as unknown as Record<string, unknown>).idempotency_key).toBeUndefined();
+    expect((sent as unknown as Record<string, unknown>).telnyx_conversation_id).toBeUndefined();
+    expect(stub.book).toHaveBeenCalledTimes(1);
   });
 
-  it("identical retry produces the same idempotency_key passed to the Actor", async () => {
-    const captured: CreateBookingInput[] = [];
-    const agenda = bookingAgenda((input) => {
-      captured.push(input);
-      return {
-        ok: true,
-        booking_id: "bid-1",
+  it("same conversation with changed date still routes to the same actor", async () => {
+    const calls: string[] = [];
+    const stub = {
+      book: vi.fn(async (input: ConversationBookingInput) => {
+        calls.push(input.date);
+        return {
+          kind: "confirmed",
+          booking_id: "bid-x",
+          service_id: input.service_id,
+          date: input.date,
+          time: input.time,
+        };
+      }),
+    };
+    const idFromName = vi.fn(() => stub);
+    const conversationId = "conv-stable-1";
+    const baseArgs = BASE_ARGS();
+
+    const env = { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } };
+
+    await callBooking(
+      env,
+      1,
+      baseArgs,
+      { telnyx_conversation_id: conversationId },
+    );
+    await callBooking(
+      env,
+      2,
+      { ...baseArgs, date: "2099-02-10", time: "11:00" },
+      { telnyx_conversation_id: conversationId },
+    );
+
+    expect(idFromName).toHaveBeenCalledTimes(2);
+    expect((idFromName.mock.calls[0] as unknown as [string])[0]).toBe(
+      ACTOR_NAME_FOR(conversationId),
+    );
+    expect((idFromName.mock.calls[1] as unknown as [string])[0]).toBe(
+      ACTOR_NAME_FOR(conversationId),
+    );
+    expect((idFromName.mock.calls[0] as unknown as [string])[0]).toBe(
+      (idFromName.mock.calls[1] as unknown as [string])[0],
+    );
+  });
+
+  it("different conversations use different actors", async () => {
+    const stubA = {
+      book: vi.fn(async (input: ConversationBookingInput) => ({
+        kind: "confirmed" as const,
+        booking_id: "bid-a",
         service_id: input.service_id,
         date: input.date,
         time: input.time,
-        status: "confirmed",
-      };
-    });
-    const kv = validKv(VALID_CONFIG);
+      })),
+    };
+    const stubB = {
+      book: vi.fn(async (input: ConversationBookingInput) => ({
+        kind: "confirmed" as const,
+        booking_id: "bid-b",
+        service_id: input.service_id,
+        date: input.date,
+        time: input.time,
+      })),
+    };
+    const idFromName = vi
+      .fn<(name: string) => typeof stubA>()
+      .mockImplementationOnce(() => stubA)
+      .mockImplementationOnce(() => stubB);
     const args = BASE_ARGS();
 
     await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       1,
       args,
+      { telnyx_conversation_id: "conv-alpha" },
     );
     await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       2,
       args,
+      { telnyx_conversation_id: "conv-beta" },
     );
 
-    expect(captured).toHaveLength(2);
-    expect(captured[0]!.idempotency_key).toBe(captured[1]!.idempotency_key);
-    expect(captured[0]!.idempotency_key).toMatch(/^mcp-[0-9a-f]{64}$/);
+    expect(idFromName).toHaveBeenCalledTimes(2);
+    expect((idFromName.mock.calls[0] as unknown as [string])[0]).toBe(
+      ACTOR_NAME_FOR("conv-alpha"),
+    );
+    expect((idFromName.mock.calls[1] as unknown as [string])[0]).toBe(
+      ACTOR_NAME_FOR("conv-beta"),
+    );
+    expect((idFromName.mock.calls[0] as unknown as [string])[0]).not.toBe(
+      (idFromName.mock.calls[1] as unknown as [string])[0],
+    );
+    expect(stubA.book).toHaveBeenCalledTimes(1);
+    expect(stubB.book).toHaveBeenCalledTimes(1);
   });
 
-  it("different time produces a different idempotency_key", async () => {
-    const captured: CreateBookingInput[] = [];
-    const agenda = bookingAgenda((input) => {
-      captured.push(input);
-      return {
-        ok: true,
-        booking_id: "bid-1",
-        service_id: input.service_id,
-        date: input.date,
-        time: input.time,
-        status: "confirmed",
-      };
-    });
-    const kv = validKv(VALID_CONFIG);
-    const a = BASE_ARGS();
-
-    await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
-      1,
-      a,
-    );
-    await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
-      2,
-      { ...a, time: "11:00" },
-    );
-
-    expect(captured).toHaveLength(2);
-    expect(captured[0]!.idempotency_key).not.toBe(captured[1]!.idempotency_key);
-    expect(captured[0]!.time).toBe("10:00");
-    expect(captured[1]!.time).toBe("11:00");
-  });
-
-  it("slot_unavailable → isError with the domain code", async () => {
-    const agenda = bookingAgenda(() => ({
-      ok: false,
-      code: "slot_unavailable",
+  it("missing conversation metadata → conversation_id_required, no actor call", async () => {
+    const { stub, idFromName } = conversationBookingActor(() => ({
+      kind: "confirmed",
+      booking_id: "bid-1",
+      service_id: "oil_change",
+      date: "2099-01-15",
+      time: "10:00",
     }));
-    const kv = validKv(VALID_CONFIG);
 
     const res = await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       1,
       BASE_ARGS(),
     );
@@ -950,93 +1008,392 @@ describe("/mcp — tools/call create_booking", () => {
     };
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0]!.text).toBe(
-      JSON.stringify({ error: "slot_unavailable" }),
+      JSON.stringify({ error: "conversation_id_required" }),
     );
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(stub.book).not.toHaveBeenCalled();
   });
 
-  it("infra error → service_unavailable isError", async () => {
-    const agenda = bookingAgenda(() => {
-      throw new Error("actor down");
-    });
-    const kv = validKv(VALID_CONFIG);
+  it("missing _meta entirely → conversation_id_required, no actor call", async () => {
+    const { stub, idFromName } = conversationBookingActor(() => ({
+      kind: "confirmed",
+      booking_id: "bid-1",
+      service_id: "oil_change",
+      date: "2099-01-15",
+      time: "10:00",
+    }));
 
     const res = await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       1,
       BASE_ARGS(),
     );
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      result: {
-        isError: boolean;
-        content: Array<{ type: string; text: string }>;
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "conversation_id_required" }),
+    );
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(stub.book).not.toHaveBeenCalled();
+  });
+
+  it("invalid conversation metadata (bad charset) → conversation_id_required", async () => {
+    const { stub, idFromName } = conversationBookingActor(() => ({
+      kind: "confirmed",
+      booking_id: "bid-1",
+      service_id: "oil_change",
+      date: "2099-01-15",
+      time: "10:00",
+    }));
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "has space and !chars" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "conversation_id_required" }),
+    );
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(stub.book).not.toHaveBeenCalled();
+  });
+
+  it("valid metadata + absent CONVERSATION_BOOKING binding → service_unavailable, no infra call", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = {
+      idFromName: vi.fn(() => ({
+        book: vi.fn(async () => ({ kind: "confirmed" })),
+        getOccupiedSlots: vi.fn(async () => ({ occupied: [] })),
+        createBooking: vi.fn(async () => ({ ok: true })),
+      })),
+    };
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-AZ_09" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+    expect(kv.get).not.toHaveBeenCalled();
+    expect(agenda.idFromName).not.toHaveBeenCalled();
+  });
+
+  it("confirmed replay works without CONFIG or AGENDA bindings", async () => {
+    const { stub, idFromName } = conversationBookingActor((input) => ({
+      kind: "confirmed",
+      booking_id: "bid-replay",
+      service_id: input.service_id,
+      date: input.date,
+      time: input.time,
+    }));
+    const args = BASE_ARGS();
+
+    const env = { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } };
+
+    const r1 = await callBooking(
+      env,
+      1,
+      args,
+      { telnyx_conversation_id: "conv-replay-1" },
+    );
+    const r2 = await callBooking(
+      env,
+      2,
+      args,
+      { telnyx_conversation_id: "conv-replay-1" },
+    );
+
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    const body1 = (await r1.json()) as {
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    const body2 = (await r2.json()) as {
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    expect(body1.result.isError).toBeFalsy();
+    expect(body2.result.isError).toBeFalsy();
+    expect(JSON.parse(body2.result.content[0]!.text)).toEqual(
+      JSON.parse(body1.result.content[0]!.text),
+    );
+    expect(stub.book).toHaveBeenCalledTimes(2);
+  });
+
+  it("conversation_already_booked → isError with the domain code", async () => {
+    const { idFromName } = conversationBookingActor(() => ({
+      kind: "rejected",
+      code: "conversation_already_booked",
+    }));
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-already-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "conversation_already_booked" }),
+    );
+  });
+
+  it("slot_unavailable → isError with the domain code", async () => {
+    const { idFromName } = conversationBookingActor(() => ({
+      kind: "rejected",
+      code: "slot_unavailable",
+    }));
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-slot-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "slot_unavailable" }),
+    );
+  });
+
+  it("actor throws → service_unavailable isError (no raw error leaked)", async () => {
+    const { idFromName } = conversationBookingActor(() => {
+      throw new Error("rpc failure: actor crashed");
+    });
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-rpc-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+    expect(body.result.content[0]!.text).not.toContain("rpc failure");
+  });
+
+  it("idFromName throws with sensitive sentinel → generic tool error, one log, no leak", async () => {
+    const SENTINEL = `__sentinel_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
+    const idFromName = vi.fn(() => {
+      throw new Error(
+        `internal namespace lookup failed: secret=${SENTINEL}`,
+      );
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = await callBooking(
+        { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+        1,
+        BASE_ARGS(),
+        { telnyx_conversation_id: "conv-lookup-fail-1" },
+      );
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        result: {
+          isError: boolean;
+          content: Array<{ type: string; text: string }>;
+        };
       };
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0]!.text).toBe("service_unavailable");
+      // The raw exception must never appear in the response — including
+      // the sentinel that uniquely identifies this failure path.
+      expect(JSON.stringify(body.result)).not.toContain(SENTINEL);
+
+      // Exactly one tool-result log line must be emitted, and it must not
+      // contain the sentinel.
+      const toolCallLogs = logSpy.mock.calls
+        .map((call) => call[0])
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter(
+          (e) => e.event === "mcp.tool_call" && e.tool === "create_booking",
+        );
+      expect(toolCallLogs).toHaveLength(1);
+      expect(toolCallLogs[0]!.outcome).toBe("service_unavailable");
+      for (const line of logSpy.mock.calls) {
+        expect(JSON.stringify(line)).not.toContain(SENTINEL);
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("malformed actor result (non-object) → service_unavailable", async () => {
+    const stub = { book: vi.fn(async () => "not-an-object" as unknown as ConversationBookingResult) };
+    const idFromName = vi.fn(() => stub);
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-malformed-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+
+  it("confirmed result with mismatched service/date/time → service_unavailable", async () => {
+    const stub = {
+      book: vi.fn(
+        async (input: ConversationBookingInput) =>
+          ({
+            kind: "confirmed",
+            booking_id: "bid-bad",
+            service_id: "wrong_service",
+            date: input.date,
+            time: input.time,
+          }) as ConversationBookingResult,
+      ),
+    };
+    const idFromName = vi.fn(() => stub);
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-mismatch-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+
+  it("unknown rejection code → service_unavailable", async () => {
+    const { idFromName } = conversationBookingActor(
+      () =>
+        ({
+          kind: "rejected",
+          code: "totally_unknown_code",
+        }) as unknown as ConversationBookingResult,
+    );
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-unknown-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+
+  it("infrastructure_error from actor → service_unavailable", async () => {
+    const { idFromName } = conversationBookingActor(() => ({
+      kind: "infrastructure_error",
+    }));
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      BASE_ARGS(),
+      { telnyx_conversation_id: "conv-infra-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
     };
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0]!.text).toBe("service_unavailable");
   });
 
   it("rejects unexpected arguments (e.g. idempotency_key) via SDK invalid params", async () => {
-    const captured: CreateBookingInput[] = [];
-    const agenda = bookingAgenda((input) => {
-      captured.push(input);
-      return {
-        ok: true,
-        booking_id: "bid-1",
-        service_id: input.service_id,
-        date: input.date,
-        time: input.time,
-        status: "confirmed",
-      };
-    });
-    const kv = validKv(VALID_CONFIG);
-
-    const res = await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
-      1,
-      { ...BASE_ARGS(), idempotency_key: "caller-supplied-key" },
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      result: {
-        isError: boolean;
-        content: Array<{ type: string; text: string }>;
-      };
-    };
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0]!.text).toMatch(/-32602/);
-    expect(captured).toHaveLength(0);
-  });
-
-  it("success result never contains customer name or phone", async () => {
-    const agenda = bookingAgenda((input) => ({
-      ok: true,
+    const { stub, idFromName } = conversationBookingActor((input) => ({
+      kind: "confirmed",
       booking_id: "bid-1",
       service_id: input.service_id,
       date: input.date,
       time: input.time,
-      status: "confirmed",
     }));
-    const kv = validKv(VALID_CONFIG);
 
     const res = await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
+      1,
+      { ...BASE_ARGS(), idempotency_key: "caller-supplied-key" },
+      { telnyx_conversation_id: "conv-strict-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toMatch(/-32602/);
+    expect(stub.book).not.toHaveBeenCalled();
+  });
+
+  it("success response never contains customer name or phone", async () => {
+    const { idFromName } = conversationBookingActor((input) => ({
+      kind: "confirmed",
+      booking_id: "bid-1",
+      service_id: input.service_id,
+      date: input.date,
+      time: input.time,
+    }));
+
+    const res = await callBooking(
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       1,
       {
         ...BASE_ARGS(),
         customer_name: "Alice Smith",
         customer_phone: "+5215512345678",
       },
+      { telnyx_conversation_id: "conv-pii-1" },
     );
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      result: {
-        isError?: boolean;
-        content: Array<{ type: string; text: string }>;
-      };
+      result: { isError?: boolean; content: Array<{ text: string }> };
     };
     expect(body.result.isError).toBeFalsy();
     const text = body.result.content[0]!.text;
@@ -1059,24 +1416,23 @@ describe("/mcp — tools/call create_booking", () => {
   });
 
   it("mcp.tool_call log line carries no customer name, phone, or args", async () => {
-    const agenda = bookingAgenda(() => ({
-      ok: true,
+    const { idFromName } = conversationBookingActor((input) => ({
+      kind: "confirmed",
       booking_id: "bid-1",
-      service_id: "oil_change",
-      date: "2099-01-15",
-      time: "10:00",
-      status: "confirmed",
+      service_id: input.service_id,
+      date: input.date,
+      time: input.time,
     }));
-    const kv = validKv(VALID_CONFIG);
 
     await callBooking(
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda },
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } },
       1,
       {
         ...BASE_ARGS(),
         customer_name: "Alice Smith",
         customer_phone: "+5215512345678",
       },
+      { telnyx_conversation_id: "conv-log-1" },
     );
 
     const ev = logSpy.mock.calls
@@ -1269,22 +1625,19 @@ describe("/mcp — telnyx_conversation_id correlation (params._meta)", () => {
 
   it("logs a valid telnyx_conversation_id for create_booking without altering input", async () => {
     const captured: Array<Record<string, unknown>> = [];
-    const agenda = {
-      idFromName: vi.fn(() => ({
-        createBooking: vi.fn(async (input: CreateBookingInput) => {
-          captured.push({ ...input });
-          return {
-            ok: true,
-            booking_id: "bid-meta",
-            service_id: input.service_id,
-            date: input.date,
-            time: input.time,
-            status: "confirmed",
-          };
-        }),
-      })),
+    const stub = {
+      book: vi.fn(async (input: ConversationBookingInput) => {
+        captured.push({ ...input });
+        return {
+          kind: "confirmed" as const,
+          booking_id: "bid-meta",
+          service_id: input.service_id,
+          date: input.date,
+          time: input.time,
+        };
+      }),
     };
-    const kv = validKv(VALID_CONFIG);
+    const idFromName = vi.fn(() => stub);
     const args = {
       service_id: "oil_change",
       date: futureOpenDate(),
@@ -1298,7 +1651,7 @@ describe("/mcp — telnyx_conversation_id correlation (params._meta)", () => {
       bookingCallWithMeta(args, {
         telnyx_conversation_id: "conv-1234:abc",
       }),
-      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+      { SECRETS: validSecrets(), CONVERSATION_BOOKING: { idFromName } } as never,
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -1313,7 +1666,8 @@ describe("/mcp — telnyx_conversation_id correlation (params._meta)", () => {
     const [ev] = toolCalls("create_booking");
     expect(ev?.telnyx_conversation_id).toBe("conv-1234:abc");
 
-    // Metadata must not change what reaches the Actor.
+    // Metadata must not change what reaches the Actor — and the MCP layer
+    // must not derive an idempotency_key from request fields anymore.
     expect(captured).toHaveLength(1);
     expect(captured[0]!.service_id).toBe("oil_change");
     expect(captured[0]!.date).toBe(args.date);
@@ -1322,7 +1676,7 @@ describe("/mcp — telnyx_conversation_id correlation (params._meta)", () => {
     expect(captured[0]!.customer_phone).toBe("+5215512345678");
     expect(captured[0]!.confirmed).toBe(true);
     expect((captured[0] as Record<string, unknown>).telnyx_conversation_id).toBeUndefined();
-    expect(typeof captured[0]!.idempotency_key).toBe("string");
+    expect((captured[0] as Record<string, unknown>).idempotency_key).toBeUndefined();
   });
 
   it("omits the field when _meta is missing entirely", async () => {

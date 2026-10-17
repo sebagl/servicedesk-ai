@@ -1978,3 +1978,196 @@ assistant retries safe; the result never includes customer name or phone; the bo
 persisted in the DayAgenda Actor (`main-2026-10-21`).
 
 Synthetic test data only (`+15550000001`, "Test Caller").
+
+## 4.x — Conversation-scoped booking coordinator + Actor binding (local review, 2026-10-17)
+
+**Date:** 2026-10-17
+**Scope:** Local code review and mocked test sweep of the dynamic-variables
+webhook, the conversation-scoped booking coordinator, the `ConversationBooking`
+StatefulActor, and the MCP `create_booking` route through the new Actor. No
+remote checks were performed against the 2026-10-16 deployed function.
+**Not claimed:** deployment, runtime cross-Actor execution/concurrency, Telnyx
+AI Assistant integration. All claims below are from `npm run typecheck` and
+`npm test` against the local mocked suite.
+
+### Webhook — 800 ms config wait, degraded fallback, early-rejection logs
+
+`src/dynamic-variables.ts` races `loadConfig(kv)` against `CONFIG_WAIT_MS = 800`
+inside `loadConfigBounded()`. A late resolution is discarded; a late rejection
+is caught so it cannot escape as an unhandled promise rejection.
+
+- **Bounded wait verified.** `webhook.test.ts` ("config resolves before
+  deadline" / "config never resolves → degraded at the 800ms deadline" /
+  "config resolves after timeout → no second log, no unhandled rejection" /
+  "config rejects after timeout → no unhandled rejection") confirm the
+  800 ms race, the swallowed late rejection, and the absence of an
+  unhandled-rejection event when the config promise settles after timeout.
+- **Degraded fallback verified.** When the deadline fires first,
+  `system_status` becomes `"degraded"`, `booking_enabled` becomes `"false"`,
+  and `service_list` is empty; the response is still `200` so the call
+  continues.
+- **Early-rejection logs verified.** The "early rejection logging" suite
+  asserts exactly one `webhook.rejected` event per case
+  (`method_not_allowed` 405, `payload_too_large` 413, `body_read_failed`
+  400, `invalid_json` 400). Each event carries `reason`, `http_status`, and
+  `latency_ms`. The privacy test
+  ("does not log the request body, headers, or unvalidated identifiers")
+  confirms that no request body, header value, sentinel phone, call id,
+  assistant id, or credential reaches any log line.
+
+### MCP — conversation metadata correlation
+
+`src/mcp-server.ts` reads `telnyx_conversation_id` from
+`extra._meta["telnyx_conversation_id"]` (never from tool arguments or
+headers) through `readConversationId()`. The id is matched against
+`/^[A-Za-z0-9:_-]{1,128}$/` so it cannot inject into a structured log.
+
+- The "telnyx_conversation_id correlation (params._meta)" suite asserts
+  the field is logged for `get_service_catalog`, `get_availability`, and
+  `create_booking` when valid; omitted when `_meta` is missing, not a
+  string, >128 characters, or contains disallowed characters; and never
+  alters tool results when metadata is invalid.
+- `call_control_id` and `telnyx_conversation_id` are recorded as
+  separate fields; the former comes from the bounded `x-call-control-id`
+  header, the latter from `params._meta`.
+
+### Conversation coordinator — pending/confirmed recovery and stable attempt keys
+
+`src/conversation-booking.ts` implements `coordinateBooking()` over a single
+aggregate (`idle` / `pending` / `confirmed`) at `STORAGE_KEY = "booking"`.
+
+- **Recovery on pending + confirmed.** The "ambiguous failure then recovery
+  reuses the same idempotency key" suite asserts that when the executor
+  throws, the coordinator preserves `pending` and returns
+  `infrastructure_error`; a subsequent identical call resolves the same
+  attempt key and retries the executor (not a fresh attempt). Confirmed
+  replays return the stored result without loading KV or contacting AGENDA
+  (see `conversation-actor.test.ts` "confirmed replay"). Failed confirmation
+  writes are also recoverable on the next call using the same attempt key.
+- **Stable attempt keys.** `generateAttemptKey()` is invoked once per new
+  attempt (a fresh key for a corrected request, the original key for a
+  retry of a pending attempt). The "pending rejection with changed input
+  starts a fresh attempt in the same call using a new key" suite verifies
+  the old pending is resolved with its original input/key and a corrected
+  attempt uses a new key in the same call.
+- **State validation.** Malformed executor outputs (`null`, array, unknown
+  kind, empty `booking_id`, mismatched service/date/time, missing or
+  unknown rejection code, `idempotency_key_conflict`) are all treated as
+  ambiguous: pending is preserved, no `idle` or `confirmed` is written,
+  and `infrastructure_error` is returned. Persisted `confirmed` aggregates
+  whose `result` does not match their own `input` fail closed without
+  calling the executor.
+
+### ConversationBooking Actor binding + MCP routing by conversation ID
+
+`src/conversation-actor.ts` exports `ConversationBooking` (already declared
+in `telnyx.toml` as `[[actors]] CONVERSATION_BOOKING → ConversationBooking`).
+`ConversationBooking.book()` delegates to `coordinateBooking()` with
+`randomUUID` for `generateAttemptKey()`; the executor path loads trusted
+`loadConfig(env.CONFIG)` and routes to `env.AGENDA.idFromName(...)`
+(`createBooking()` in `src/booking-service.ts`).
+
+- **Stable Actor name.** `mcp-server.ts` derives
+  `conversationActorName(conversationId) = "conversation-" + sha256(id)` so
+  the same conversation always lands on the same Actor instance. The
+  MCP "same conversation with changed date still routes to the same
+  actor" and "different conversations use different actors" suites verify
+  the routing.
+- **Binding failure modes.** The MCP layer reports:
+  - missing/invalid conversation metadata → `conversation_id_required`
+    (Actor never called);
+  - valid metadata but missing `CONVERSATION_BOOKING` binding →
+    `service_unavailable` (not `conversation_id_required`; that code is
+    reserved for missing metadata);
+  - `idFromName()` or `book()` throws (raw sentinel suppressed) →
+    `service_unavailable`;
+  - malformed Actor result (non-object, mismatched confirmed result,
+    unknown rejection code) → `service_unavailable`.
+- The Actor's own `executeBooking()` fails closed when the CONFIG or AGENDA
+  binding is missing, when the loaded config's `location_id` does not
+  match the saved attempt's `location_id`, or when `loadConfig` rejects.
+
+### Check results (local, mocked)
+
+- `npm run typecheck` (`tsc --noEmit`) → **0 errors**
+- `npm run test` (`vitest run`) → **377/377 passed** across 11 test files
+  (33 smoke, 58 scheduling, 13 TZ-independence, 64 agenda-actor,
+  37 availability, 45 bookings, 55 MCP, 21 conversation-booking,
+  8 conversation-actor, 24 booking-service, 19 webhook).
+
+### NOT verified by this review
+
+These changes post-date the 2026-10-16 ship that produced the recorded
+public URL. They are **NOT claimed deployed**; re-run `telnyx-edge ship`
+before relying on any of them remotely.
+
+- Full MCP → `ConversationBooking` → `DayAgenda` integration on the
+  remote runtime. Manual authenticated MCP clients can exercise the
+  `telnyx_conversation_id` path by sending `params._meta` directly in a
+  `tools/call` request — a Telnyx Assistant is not the only way to set
+  `_meta`; the JSON-RPC envelope accepts it from any authenticated
+  caller.
+- Real cross-Actor execution and concurrency — a request must traverse
+  `MCP → ConversationBooking.idFromName().book() → loadConfig →
+  AGENDA.idFromName().createBooking() → ctx.storage.put`. Mocked tests
+  prove the logic; they do not prove platform dispatch across two Actor
+  types under load.
+- Remote persistence of the conversation aggregate, rehydration across
+  Actor instance eviction/restart, and atomicity of the
+  `pending → confirmed` transition's `ctx.storage.put` (regression tests
+  cover storage-failure paths but the persistence guarantee itself is
+  only inferred from the local fake).
+- Telnyx AI Assistant integration — no live Assistant, no
+  `assistant.initialization` traffic, no end-to-end voice/phone flow.
+- Webhook signature verification on `/webhooks/dynamic-variables`,
+  monitoring/alerting, and the operations portal remain pending.
+
+### Local simulated integration: MCP → ConversationBooking → DayAgenda
+
+`test/booking-flow.integration.test.ts` (6 tests, added in this subtask)
+exercises the real `handler.fetch` + real MCP SDK + real `ConversationBooking`
++ real `DayAgenda` end-to-end, with namespace fakes that keep separate
+serialized storage per Actor name and reconstruct Actor objects over
+preserved storage between calls. **Mocked: the `@telnyx/edge-runtime`
+`StatefulActor` base, secrets, KV, and the namespace dispatch wrappers.
+Storage is in-process and serialized through the same JSON fake used by
+the rest of the suite — these tests are NOT proof of runtime
+serialization, concurrency, or remote persistence.**
+
+| # | Scenario | Outcome |
+|---|---|---|
+| 1 | New conversation books 10:00 | `confirmed`, DayAgenda occupancy = `[10:00]` |
+| 2 | Identical retry on the same conversation | Same `booking_id`, one stored booking |
+| 3 | Same conversation, changed date/time | `conversation_already_booked`, no second booking |
+| 4 | Second conversation targets occupied slot | `slot_unavailable`; same conversation succeeds on 11:00 |
+
+Two distinct lost-response failure scenarios are exercised:
+
+- **Lost ConversationBooking confirmed-state write (test 5).** The fake
+  conversation Actor's storage `put` is wrapped so the second call (the
+  `pending → confirmed` write) throws. `DayAgenda.createBooking` runs
+  end-to-end and persists the booking first; the conversation Actor's
+  `confirmed`-state write then fails. Retry with changed input resolves
+  the original `pending` attempt with the original `attempt_key` via
+  `DayAgenda` idempotency replay, returns `conversation_already_booked`,
+  and preserves the original `booking_id` with no additional booking in
+  `DayAgenda`.
+
+- **Lost RPC response from `DayAgenda` (test 6).** The fake `AGENDA`
+  namespace wrapper awaits the real `DayAgenda.createBooking` result
+  (the booking IS persisted) and then throws once instead of returning
+  it. `ConversationBooking.executeBooking`'s try/catch collapses the
+  throw to `infrastructure_error`; `validateExecutorResult` classifies
+  it as ambiguous; the coordinator preserves `pending` and the MCP
+  layer surfaces `service_unavailable`. Retry with changed input
+  resolves the original `pending` attempt with the original
+  `attempt_key` via `DayAgenda` idempotency replay, returns
+  `conversation_already_booked`, and preserves the original
+  `booking_id` with no additional booking in `DayAgenda`.
+
+Both scenarios end in the same observable state on the wire
+(`conversation_already_booked`, one `DayAgenda` booking, one
+`ConversationBooking` confirmed aggregate locked to the original input)
+but reach it through different failure paths. Test 5 fails the
+conversation Actor's `confirmed`-state write; test 6 fails the RPC
+delivery from `DayAgenda` after the Agenda had already persisted.

@@ -58,10 +58,19 @@ Source: [Project Structure](https://developers.telnyx.com/docs/edge-compute/stat
 
 Three tools, all bound to the same MCP server (stateless per-request):
 - `get_service_catalog` — services + `booking_enabled` admission flag.
-- `get_availability` — open slots for a `YYYY-MM-DD` date.
-- `create_booking` — create one booking; idempotency key is server-derived
-  (sha256 of `customer_phone|date|time|service_id`), so identical arguments
-  reuse the booking and a different `time` may create another booking.
+  Usable without conversation metadata.
+- `get_availability` — open slots for a `YYYY-MM-DD` date. Usable without
+  conversation metadata.
+- `create_booking` — write path; routes through the
+  `ConversationBooking` Actor keyed by conversation id
+  (`params._meta["telnyx_conversation_id"]`, sha256-hashed). Requires
+  conversation metadata: missing or invalid metadata returns
+  `conversation_id_required` and never reaches an Actor. Conversation
+  identity is read from SDK metadata only — never from tool arguments
+  or correlation headers. One confirmed booking per conversation is
+  enforced by the Actor; changed input after a confirmed booking
+  returns `conversation_already_booked`. Customer PII (name, phone)
+  never leaves the boundary in any response.
 
 ## Telnyx AI Assistant init webhook
 
@@ -79,7 +88,7 @@ follow-up.
 ```bash
 npm install
 npm run typecheck    # tsc --noEmit (strict mode) — 0 errors
-npm test             # vitest run (mocked) — 337/337 passing
+npm test             # vitest run (mocked) — 377/377 passing
 ```
 
 ### Local runtime (verified historical probe)
@@ -128,8 +137,13 @@ All recorded remote checks happened against this URL. The three MCP tools,
 the `/demo/*` route set (config / availability / bookings), and the public
 boundaries all have recorded deployment evidence (see `docs/verification.md`
 subtasks 1.5.4, 1.5.5, 2.2d, 2.3e, 2.4d, 3.1b, 3.3). Local changes after that
-evidence — notably the `dynamic-variables` webhook extraction — are **not
-claimed deployed**; re-run `telnyx-edge ship` before relying on them remotely.
+evidence — the `dynamic-variables` webhook extraction **and** the
+`ConversationBooking` Actor routing that replaced the old content-derived
+MCP idempotency key — are **not claimed deployed**; re-run `telnyx-edge
+ship` before relying on them remotely. The 2026-10-16 subtask 3.3 evidence
+refers to the old content-derived key (`sha256(phone|date|time|service_id)`)
+and is preserved as historical, not as proof of the conversation-Actor
+implementation.
 
 ## Secret bindings (separate, never recorded)
 
@@ -170,12 +184,9 @@ route.
 ## Pending (not implemented)
 
 - Voice AI Assistant / Conversation Workflow / phone-number integration.
-- Webhook signature verification on `/webhooks/dynamic-variables`.
-- A stable, caller-supplied booking-attempt idempotency strategy for the
-  MCP `create_booking` tool. Today the MCP key is derived from
-  `customer_phone|date|time|service_id`, so identical arguments dedupe but a
-  changed `time` for the same caller can create another booking. HTTP
-  `/demo/bookings` already accepts a caller-provided `idempotency_key`.
+- Webhook signature verification on `/webhooks/dynamic-variables` (the
+  endpoint is currently unauthenticated; authenticity, monitoring, and
+  the workflow task remain pending and unchanged in scope).
 - Monitoring, alerts, and an operations portal.
 
 ## Official source URLs

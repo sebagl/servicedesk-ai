@@ -18,10 +18,10 @@ points today.
 |---|---|---|
 | `GET /health` (and `/health/liveness`, `/health/readiness`) | none | Liveness probe; does not prove KV or Actor reachability |
 | `POST /webhooks/dynamic-variables` | none (signature verification pending) | Telnyx Assistant init webhook |
-| `POST /mcp` | `MCP_AUTH` bearer (`MCP_API_TOKEN`) | MCP server, stateless streamable HTTP |
+| `POST /mcp` | `MCP_AUTH` bearer (`MCP_API_TOKEN`) | MCP server, stateless streamable HTTP. Browser `Origin` → 404 |
 | `GET /demo/config` | `SMOKE_AUTH` bearer (`SMOKE_TEST_TOKEN`) | Returns validated KV config |
 | `GET /demo/availability?date=YYYY-MM-DD` | `SMOKE_AUTH` | Slots for one date with Actor occupancy |
-| `POST /demo/bookings` | `SMOKE_AUTH` | Create one booking (delegates to the Actor) |
+| `POST /demo/bookings` | `SMOKE_AUTH` | Create one booking (delegates to `DayAgenda`) |
 | `POST\|GET /demo/counter/:id/{increment,read}` | `SMOKE_AUTH` | Platform probe (Counter actor) |
 
 Failure modes (intentionally distinct across surfaces):
@@ -50,16 +50,22 @@ session state):
 
 - `get_service_catalog` — `{}` → `{ services, booking_enabled }`. Reads KV
   through the same `loadConfig` so runtime validation and fail-closed
-  semantics apply unchanged.
+  semantics apply unchanged. Usable without conversation metadata.
 - `get_availability` — `{ date }` → `{ date, timezone, booking_enabled,
   available_times }`. Combines `loadConfig` + `getAvailability` + Actor
-  occupancy.
+  occupancy. Usable without conversation metadata.
 - `create_booking` — `{ service_id, date, time, customer_name,
   customer_phone, confirmed }` → `{ status, booking_id, service_id, date,
-  time }` or a tool-error `{ error }`. The idempotency key is **server-derived
-  (sha256 of `customer_phone|date|time|service_id`)** — identical arguments
-  reuse the booking; a different `time` with the same caller will create a
-  different booking. Customer PII never leaves the boundary in any response.
+  time }` or a tool-error `{ error }`. **Requires** conversation metadata:
+  `telnyx_conversation_id` is read from
+  `params._meta["telnyx_conversation_id"]` and matched against
+  `/^[A-Za-z0-9:_-]{1,128}$/`. Missing or invalid metadata returns
+  `conversation_id_required` and never reaches an Actor. The same
+  conversation is routed to the same `ConversationBooking` Actor instance
+  (`conversation-${sha256(id)}`), so one confirmed booking per conversation
+  is enforced end-to-end. After confirmation, changed input returns
+  `conversation_already_booked`; identical replays return the original
+  result. Customer PII never leaves the boundary in any response.
 
 ## Dynamic-variables webhook (`src/dynamic-variables.ts`)
 
@@ -90,12 +96,20 @@ trusted `loadConfig`, Actor lookup by name (`agendaActorName(locationId, date)`
   reader (10 KiB), structural validation, dependency wiring, response
   mapping. **No business admission** — all rules live in the Actor.
 - `src/mcp-server.ts` (`create_booking` tool) — MCP adapter: Zod-strict
-  input, server-derived idempotency key, identical `BookingServiceDeps`
-  shape, error → `toolError(code)`.
+  input, conversation metadata extracted from `params._meta`,
+  `conversationActorName(id) = "conversation-${sha256(id)}"` for stable
+  Actor routing, conversation-Actor result validation
+  (`confirmed` / domain-rejected / `service_unavailable`), error →
+  `toolError(code)`. Read tools (`get_service_catalog`,
+  `get_availability`) skip the metadata requirement and are usable
+  without conversation identity.
 
-Both adapters reuse the same `createBooking` so admission rules, replay-first
-semantics, clock handling, and persistence are identical regardless of the
-entry point.
+Both write adapters reuse the same `createBooking` for the `DayAgenda`
+path so admission rules, replay-first semantics, clock handling, and
+persistence are identical regardless of the entry point. The MCP write
+path adds the conversation Actor on top, so one confirmed booking per
+conversation is enforced in addition to the per-slot
+`DayAgenda` admission.
 
 ## Stateful Actor — `DayAgenda` (`src/agenda-actor.ts`)
 
@@ -111,6 +125,29 @@ entry point.
 
 The Actor owns admission and persistence; the application service and
 adapters do no business validation.
+
+## Stateful Actor — `ConversationBooking` (`src/conversation-actor.ts`)
+
+- One instance **per trusted Telnyx conversation**, addressed as
+  `conversation-${sha256(telnyx_conversation_id)}`. Owns the
+  one-booking-per-conversation aggregate (booking-domain.md §10).
+- Single-aggregate storage key `"booking"`:
+  `{ kind: "idle" }` | `{ kind: "pending", input, attempt_key, location_id }`
+  | `{ kind: "confirmed", input, attempt_key, location_id, result }`.
+- `book(input)` (write) — `coordinateBooking()` loads the aggregate, decides
+  between confirmed replay / pending resolution / new attempt, persists
+  pending before execution, and only writes `confirmed` or `idle` after the
+  executor result is validated. The executor path loads trusted `loadConfig`
+  and routes to `DayAgenda.idFromName(...)` (`createBooking()` in
+  `src/booking-service.ts`).
+- The Actor owns attempt-key stability and conversation-scoped state; the
+  MCP layer never consults KV or AGENDA before calling. RPC callers never
+  supply config, location, attempt key, or credentials; the adapter injects
+  them from `this.env` and the persisted saved attempt.
+
+`DayAgenda` remains the authoritative owner of slot occupancy and booking
+persistence. The two Actor types do **not** share a transaction or an
+exactly-once delivery guarantee.
 
 ## KV config (`src/config.ts`)
 
@@ -137,7 +174,7 @@ reach infrastructure.
 ## What's verified vs. what isn't
 
 **Verified — local mocked tests** (`npm run typecheck` 0 errors, `npm test`
-337/337 passing):
+377/377 passing):
 
 - HTTP routing, method handling, and 404 behavior for every route.
 - Full auth gate: absent/empty/rejecting secret → `503`; missing/malformed/
@@ -147,8 +184,18 @@ reach infrastructure.
   fallback, structured logs (masked phone, no full phone or name leakage),
   unhandled rejection suppression on late KV resolutions/rejections.
 - MCP: protocol handling, tool gating on bindings, Zod-strict input,
-  domain error → tool-error mapping, server-derived idempotency, correlation
-  id extraction from JSON-RPC `_meta`.
+  domain error → tool-error mapping, correlation id extraction from
+  JSON-RPC `_meta` (`telnyx_conversation_id`), stable Actor routing by
+  `sha256(conversationId)`, missing/malformed metadata →
+  `conversation_id_required`, missing binding → `service_unavailable`,
+  malformed Actor result collapse, no PII in logs or responses.
+- ConversationBooking Actor + coordinator: pending/confirmed/idle state
+  machine, stable attempt keys across retries, pending preservation
+  on ambiguous executor outcomes, fresh attempt with new key for a
+  corrected request, executor result validation (null, array, unknown
+  kind, empty `booking_id`, mismatched fields, unknown rejection code,
+  `idempotency_key_conflict`), failed-write recovery, missing CONFIG /
+  AGENDA binding closed paths, mismatched persisted `confirmed` shape.
 - Booking application service: dependency wiring, response-shape validation,
   domain error mapping. No admission rules — those live in the Actor.
 - DayAgenda Actor: admission (service, window, weekday, time, past,
@@ -168,15 +215,19 @@ reach infrastructure.
 - End-to-end booking creation, replay, occupancy reflection.
 - Bounded remote concurrency: 20 racing POSTs, exactly 1 confirmed, 19
   `slot_unavailable`, no ambiguous outcomes.
-- MCP: `initialize` plus all three tools (`get_service_catalog`,
-  `get_availability`, `create_booking`) including `create_booking` replay and
-  occupancy reflection through the MCP transport.
+- MCP: `initialize` plus `get_service_catalog` (3.1b) and `create_booking`
+  with replay + occupancy reflection (3.3) against the deployed function.
+  Subtask 3.3 used the **old content-derived idempotency key**
+  (`sha256(phone|date|time|service_id)`); it is preserved as historical
+  evidence of the prior implementation, not as proof of the current
+  conversation-Actor routing.
 
 **Local changes after the recorded evidence are not claimed deployed.** The
-dynamic-variables webhook extraction (and any later local changes) post-date
-the 2026-10-16 ship that produced the recorded public URL; re-run
-`telnyx-edge ship` before relying on them remotely. The three MCP tools and
-the `/demo/*` route set are part of the recorded evidence.
+dynamic-variables webhook extraction **and** the `ConversationBooking` Actor
+routing post-date the 2026-10-16 ship that produced the recorded public URL;
+re-run `telnyx-edge ship` before relying on them remotely. The
+`/demo/*` route set and the read-side MCP tools (`get_service_catalog`,
+`get_availability`) are part of the recorded evidence.
 
 **Local `dev` does not emulate `[[secrets]]` or `[storage.kv]`.** Auth-gated
 demo routes and `/mcp` return `503` locally. The dynamic-variables webhook is
@@ -188,10 +239,7 @@ and is preserved as historical platform-probe evidence only.
 ## Pending (planned, not implemented)
 
 - Voice AI Assistant / Conversation Workflow / phone-number integration.
-- Webhook signature verification on `/webhooks/dynamic-variables`.
-- A stable, caller-supplied booking-attempt idempotency strategy for the
-  MCP `create_booking` tool. Today the MCP key is derived from
-  `customer_phone|date|time|service_id`, so identical arguments dedupe but a
-  changed `time` for the same caller can create another booking. HTTP
-  `/demo/bookings` already accepts a caller-provided `idempotency_key`.
+- Webhook signature verification on `/webhooks/dynamic-variables`
+  (authenticity, monitoring, and the workflow task remain pending and
+  unchanged in scope).
 - Monitoring, alerts, and an operations portal.

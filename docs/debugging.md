@@ -429,3 +429,324 @@ every entry in `occupied` to be a string in that set, with no
 duplicates. Any failure returns `{ kind: "service_unavailable" }` —
 fail-closed, no silent dropping. Valid empty and populated responses
 still parse and produce the same `slots` output.
+
+## Privacy test passed vacuously: it asserted against zero rejection events
+
+### Context
+
+The early-rejection logging suite in `test/webhook.test.ts` is the
+privacy gate for the dynamic-variables webhook: each early-rejection
+case asserts that exactly one `webhook.rejected` log line is emitted
+and that the line never contains the request body, the call id, the
+assistant id, the authorization header, or a sentinel phone number.
+
+### Discovery
+
+Code review of `findEvent`/`logEvents()` helpers and the assertion
+shape revealed a structural defect in the privacy test
+("does not log the request body, headers, or unvalidated identifiers").
+The test issued an invalid-JSON POST and asserted the rejection event
+existed, but every `expect(serialized).not.toContain(...)` ran against
+`JSON.stringify(logEvents())` — and the entire `logEvents()` collection
+for the test was checked once at the end. If a future change
+accidentally logged a sentinel in any unrelated event, this test would
+not catch it: the sentinels are not present in the events that the test
+exercises, so the assertions held even if some other code path leaked
+a sentinel into a different log line. The test passed vacuously over
+the very data it claimed to inspect.
+
+### Risk
+
+The dynamic-variables webhook logs a masked phone suffix for
+correlation. A regression that introduced a raw phone, call id, or
+authorization header into any `logEvent()` call would slip past this
+test as long as the regression landed on an event the test does not
+inspect. This is a **potential privacy regression risk**, not an
+observed data leak. No production deployment has emitted customer PII
+in any log line; the failure mode was found in the test itself.
+
+### Fix
+
+Tighten the privacy test so every assertion is scoped to the
+`webhook.rejected` event the request produced (or, if broader coverage
+is wanted, assert the sentinels are absent from the union of events
+emitted by the test plus a few explicit peers). Do not rely on the
+union assertion alone — group checks per event class so a regression in
+one event cannot silently pass against another. Existing tests stay
+green; the structure of the privacy check is what changes.
+
+### Regression coverage
+
+A follow-up review should re-read every `logEvent` call site in
+`src/dynamic-variables.ts`, `src/mcp-server.ts`, `src/index.ts`, and
+`src/logger.ts` and assert per-event that no phone number, call id,
+assistant id, idempotency key, customer name, or authorization header
+ever reaches a log line. No new production tests are required; the
+existing privacy sentinel test is the regression gate.
+
+## Coordinator accepted malformed executor results, risking unsafe state transitions
+
+### Context
+
+`coordinateBooking()` (in `src/conversation-booking.ts`) runs the
+executor (the `ConversationBooking.executeBooking()` path that calls
+`loadConfig` and routes to `AGENDA.createBooking`) and stores its
+return value directly. An executor can return: an object with `kind:
+"confirmed"` and a `booking_id`; an object with `kind: "rejected"` and
+a `code`; an object with `kind: "infrastructure_error"`; or anything
+else (a thrown error, `null`, an array, an unknown `kind`, a confirmed
+result with an empty `booking_id`, a confirmed result whose
+`service_id` / `date` / `time` do not match the saved attempt, a
+rejection with no `code`, or a rejection with a code outside the
+allowlist).
+
+### Discovery
+
+Found by local code review of the coordinator's three branches
+(`resolvePending`, `startNewAttempt`, and the `confirmed` replay path).
+The pre-fix code only `try / catch`-ed thrown errors and otherwise
+treated the executor's return as authoritative. A `null` return would
+have crashed on `raw.kind`; a confirmed result with a `booking_id` of
+`""` would have been persisted as a confirmed booking; a rejection with
+an unknown code would have been echoed back to the MCP layer as if it
+were a valid domain error; a confirmed result whose echoed fields
+disagreed with the saved attempt could have stored a result for one
+booking under another attempt's key. None of these were observed
+in production; the bugs were caught in local review before any deploy.
+
+### Risk
+
+The coordinator owns the `pending → confirmed` and `pending → idle`
+transitions. A malformed result that the coordinator treats as
+authoritative can:
+
+- persist an `idle` aggregate while the executor's outcome was actually
+  ambiguous (a definitive rejection followed by an attempted fresh
+  attempt against a missing binding would overwrite a recoverable
+  pending with `idle`, permanently losing the original key);
+- persist a `confirmed` aggregate whose `result` does not match the
+  saved `input`, desynchronizing the conversation's view from
+  `DayAgenda`'s view;
+- echo a non-allowlisted error code back to the caller, breaking the
+  MCP layer's allowlist and giving the caller a code it cannot interpret.
+
+This is a **correctness and consistency risk**, not an observed
+production incident. No malformed executor result has ever reached the
+coordinator on a deployed function; the bug was caught in review.
+
+### Fix
+
+Add a strict `validateExecutorResult(raw, saved)` step that runs before
+any storage transition. It returns a discriminated triple
+(`confirmed` / `rejected` / `ambiguous`) or `null` for any malformed
+shape (`null`, array, unknown `kind`, empty `booking_id`,
+service/date/time mismatch with the saved attempt, missing or unknown
+rejection code, `idempotency_key_conflict`, or `infrastructure_error`).
+Both `null` and `ambiguous` are treated identically by the coordinator:
+preserve `pending`, do not write `idle` or `confirmed`, return
+`infrastructure_error`. The confirmed path also cross-references the
+executor result with the saved attempt before storing it.
+
+### Regression coverage
+
+The executor-validation suite in `test/conversation-booking.test.ts`
+adds eight focused cases: malformed confirmed result with empty
+`booking_id`, malformed confirmed result with mismatched
+`service_id`, missing rejection code, unknown rejection code,
+`idempotency_key_conflict` from the executor, `null` executor result,
+array executor result, and executor result with an unknown `kind`. Each
+case asserts (a) the coordinator returns `infrastructure_error`, (b) the
+executor was called exactly once, and (c) the persisted aggregate
+remains `pending` with the original `attempt_key`. Persisted confirmed
+mismatch cases verify the executor is not called at all when the
+stored result's `service_id` or `time` disagrees with its own saved
+`input`.
+
+## Pending rejection returned the old error for changed input instead of starting the corrected attempt after persisting idle
+
+### Context
+
+When `resolvePending()` encounters a definitive domain rejection
+(`slot_unavailable`, `time_invalid`, etc.) from the executor, it must
+decide what to do based on whether the **current** request matches the
+**saved** pending input. A pre-fix early branch returned the rejection
+code as soon as it saw a definitive result, without checking whether
+the caller's input had changed since the pending was persisted. The
+intent in `booking-domain.md` §10 is: same input → return the rejection;
+changed input → persist `idle` first, then start a fresh attempt in
+the same call with a new attempt key.
+
+### Discovery
+
+Found by local code review of the conditional branches in
+`resolvePending()` against the test suite. The pre-fix path returned
+the rejection to the caller without persisting `idle`, so the next call
+would still see the same `pending` aggregate and either retry the
+rejected attempt (same key) or, if the caller did not change input,
+echo the same rejection. A corrected attempt by the same caller would
+never be admitted in the same call — the caller would have to make a
+second request, observe `infrastructure_error` (pending still there) or
+the same `rejected` (now identical to pending), and then make a third
+call. None of these loops were observed on a deployed function; the
+issue was caught in review.
+
+### Risk
+
+A caller that re-issued a corrected request (different `time`, same
+`customer_name`/`customer_phone`) immediately after a `slot_unavailable`
+on the same conversation would not have its corrected attempt admitted
+in the same call. The caller would see the old `slot_unavailable` and
+might infer the slot is still being retried by the server. The
+coordination contract in `booking-domain.md` §10 explicitly says
+"definitive domain rejection permits a new corrected attempt"; the
+pre-fix code violated that contract.
+
+This is a **correctness and contract risk**, not an observed
+production incident.
+
+### Fix
+
+Reorder `resolvePending()`: after a definitive rejection, persist
+`idle` first (if the write fails, return `infrastructure_error` and do
+not start the fresh attempt). Then, if the current input matches the
+saved input, return the rejection code. If it differs, call
+`startNewAttempt(current, deps)` so the corrected attempt is admitted
+in the same call with a new backend-generated `attempt_key`. The
+fresh-attempt path reuses the existing `startNewAttempt()` logic, so
+the same `pending → idle → pending → confirmed/idle` sequence applies.
+
+### Regression coverage
+
+Two new cases in `test/conversation-booking.test.ts`:
+
+1. **"pending rejection with changed input starts a fresh attempt in
+   the same call using a new key"** — verifies the executor is called
+   twice, the first call resolves the original saved input with the
+   original `attempt_key`, the second call uses the current input with
+   a new `attempt_key`, and the final persisted aggregate is `confirmed`
+   with the fresh attempt's data.
+2. **"pending rejection with changed input but failed idle write does
+   NOT execute the new attempt"** — verifies that when the
+   `pending → idle` write fails, the coordinator returns
+   `infrastructure_error` and the executor is called exactly once (no
+   fresh attempt is attempted against a half-persisted state).
+
+A pre-existing case ("pending rejection with same input persists idle
+and returns the rejection without a second call") confirms the same-input
+branch still returns the rejection and stops after one executor call.
+
+## Missing Actor binding incorrectly reported `conversation_id_required`
+
+### Context
+
+In the MCP `create_booking` handler, two distinct failure modes both
+indicated "you didn't send conversation metadata":
+
+1. Missing or malformed `params._meta["telnyx_conversation_id"]`
+   (regex mismatch, length > 128, missing `_meta`).
+2. Valid metadata present, but the `CONVERSATION_BOOKING` Actor binding
+   was not wired in `telnyx.toml` (or failed to load at runtime).
+
+The first is a caller problem: the Assistant must forward metadata. The
+second is a configuration defect: the function is misconfigured and the
+caller cannot fix it by sending metadata. Both surfaced as
+`conversation_id_required` in the pre-fix code.
+
+### Discovery
+
+Found by local code review of the gating order in `registerCreateBooking`.
+The pre-fix code returned `conversation_id_required` for any path that
+could not reach the Actor, including the "valid metadata, no binding"
+case. That code label is misleading for the second case — the caller
+cannot resolve a configuration defect by retrying with metadata.
+
+### Risk
+
+If `conversation_id_required` is returned for a missing-binding
+configuration error, the caller's retry loop will keep emitting the
+same metadata and the same code indefinitely. The on-call signal
+("missing binding") is hidden behind a code that looks like a caller
+fix. This is a **diagnostic and operations risk**, not an observed
+incident. No production deployment has emitted this code under the
+wrong conditions.
+
+### Fix
+
+Split the gating: missing or invalid metadata → `conversation_id_required`
+(Actor never called). Valid metadata but `conversationBooking === undefined`
+→ generic `service_unavailable` (the function is misconfigured; the
+caller cannot fix this). The latter is logged with the
+`conversation_id` correlation id so on-call can match the
+configuration defect to the originating conversation.
+
+### Regression coverage
+
+The MCP test suite adds an explicit case
+("valid metadata + absent CONVERSATION_BOOKING binding →
+service_unavailable, no infra call") that asserts:
+
+- the response is `isError: true` with the text `service_unavailable`
+  (not `conversation_id_required`);
+- the `CONVERSATION_BOOKING.idFromName` mock is never called;
+- the `mcp.tool_call` log line records `outcome: "service_unavailable"`
+  with the conversation id.
+
+The pre-existing cases
+("missing conversation metadata → conversation_id_required",
+"missing _meta entirely → conversation_id_required",
+"invalid conversation metadata (bad charset) → conversation_id_required")
+still pass and continue to assert the Actor is never called.
+
+## `idFromName` outside try/catch could expose a raw lookup error
+
+### Context
+
+In `registerCreateBooking()`, the `idFromName()` lookup on the
+`ConversationBookingNamespace` and the `stub.book()` RPC are both
+expected to throw under platform failure (binding missing at runtime,
+network failure, actor crash, `idFromName` rejecting with a sentinel
+message). The pre-fix code wrapped only `stub.book()` in a `try/catch`,
+leaving `idFromName()` exposed. A platform-side error message
+("SENTINEL-IDFROMNAME-CRASH", for example) could reach the response or
+a log line.
+
+### Discovery
+
+Found by local code review of the exception boundaries in
+`registerCreateBooking`. The narrow `try/catch` was inconsistent with
+the rest of the MCP layer (the auth gate, the catalog and availability
+handlers, and the Actor mock-style injection), and it left an obvious
+leak path on the write side.
+
+### Risk
+
+If `idFromName` rejects, the raw rejection value can reach the
+JSON-RPC envelope, the structured log line, or the response body. A
+platform error message might include diagnostic data (function id,
+binding name, internal state). This is a **leak risk**, not an
+observed incident. The mocked test suite covered `stub.book()`
+rejections but not `idFromName()` rejections.
+
+### Fix
+
+Wrap both `idFromName()` and `stub.book()` in a single `try/catch` so
+any exception from either stage collapses to a generic tool error. The
+raw exception never reaches the response, the JSON-RPC envelope, or the
+structured log. The `mcp.tool_call` log line records
+`outcome: "service_unavailable"` and the `conversation_id` correlation
+field; no other exception-derived data is logged.
+
+### Regression coverage
+
+The MCP test suite adds an explicit case
+("idFromName throws with sensitive sentinel → generic tool error, one
+log, no leak") that:
+
+- configures the `idFromName` mock to throw with a sentinel string;
+- asserts the response is `isError: true` with `service_unavailable`
+  text;
+- asserts exactly one `mcp.tool_call` log line is emitted;
+- asserts the serialized log does not contain the sentinel string.
+
+The pre-existing "actor throws" case continues to assert the same
+behavior when `stub.book()` (rather than `idFromName`) throws.
