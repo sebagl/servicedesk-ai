@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
 import type { KvNamespace } from "@telnyx/edge-runtime";
 
@@ -38,6 +40,20 @@ const CREATE_BOOKING_INPUT = z
 
 const TOOL_ERROR_TEXT = "service_unavailable";
 
+// Correlation-only id forwarded by the Assistant as JSON-RPC params._meta.
+// Bounded charset so the value can never inject into a log line. Never
+// consulted for authorization, idempotency, or any booking decision.
+const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
+type CallbackExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+function readConversationId(extra: CallbackExtra): string | undefined {
+  const meta = extra._meta as Record<string, unknown> | undefined;
+  const raw = meta?.["telnyx_conversation_id"];
+  return typeof raw === "string" && CONVERSATION_ID_PATTERN.test(raw)
+    ? raw
+    : undefined;
+}
+
 // `get_service_catalog` — read-only, returns the configured services and the
 // admission flag. Reads through the existing loadConfig so the same validation
 // and fail-closed semantics apply. Tool-handler failures never throw out —
@@ -54,26 +70,45 @@ function registerGetServiceCatalog(
         "Returns the service catalog (id, name, duration_minutes) and the booking_enabled admission flag.",
       inputSchema: GET_SERVICE_CATALOG_INPUT,
     },
-    async () => {
+    async (_args, extra) => {
       const start = Date.now();
+      const conversationId = readConversationId(extra);
       if (kv === undefined) {
-        return logToolResult("get_service_catalog", callId, start, toolError());
+        return logToolResult(
+          "get_service_catalog",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
       }
       const result = await loadConfig(kv);
       if (!result.ok) {
-        return logToolResult("get_service_catalog", callId, start, toolError());
+        return logToolResult(
+          "get_service_catalog",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
       }
-      return logToolResult("get_service_catalog", callId, start, {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              services: result.config.services,
-              booking_enabled: result.config.business.booking_enabled,
-            }),
-          },
-        ],
-      });
+      return logToolResult(
+        "get_service_catalog",
+        callId,
+        start,
+        {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                services: result.config.services,
+                booking_enabled: result.config.business.booking_enabled,
+              }),
+            },
+          ],
+        },
+        conversationId,
+      );
     },
   );
 }
@@ -125,13 +160,18 @@ function logToolResult<T>(
   callId: string,
   start: number,
   result: T,
+  conversationId?: string,
 ): T {
-  logEvent("mcp.tool_call", {
+  const fields: Record<string, string | number | boolean> = {
     tool,
     call_control_id: callId,
     outcome: classifyToolOutcome(result),
     latency_ms: Date.now() - start,
-  });
+  };
+  if (conversationId !== undefined) {
+    fields.telnyx_conversation_id = conversationId;
+  }
+  logEvent("mcp.tool_call", fields);
   return result;
 }
 
@@ -153,22 +193,36 @@ function registerGetAvailability(
         "Open appointment times for one date (YYYY-MM-DD, workshop local time America/Mexico_City). Only offer times returned here.",
       inputSchema: GET_AVAILABILITY_INPUT,
     },
-    async (args: { date: string }) => {
+    async (args: { date: string }, extra) => {
       const start = Date.now();
+      const conversationId = readConversationId(extra);
       if (!isValidDate(args.date)) {
         return logToolResult(
           "get_availability",
           callId,
           start,
           toolError("date_invalid"),
+          conversationId,
         );
       }
       if (config === undefined || agenda === undefined) {
-        return logToolResult("get_availability", callId, start, toolError());
+        return logToolResult(
+          "get_availability",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
       }
       const cfgResult = await loadConfig(config);
       if (!cfgResult.ok) {
-        return logToolResult("get_availability", callId, start, toolError());
+        return logToolResult(
+          "get_availability",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
       }
       const result = await getAvailability(
         args.date,
@@ -186,25 +240,38 @@ function registerGetAvailability(
             callId,
             start,
             toolError(result.kind),
+            conversationId,
           );
         }
-        return logToolResult("get_availability", callId, start, toolError());
+        return logToolResult(
+          "get_availability",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
       }
-      return logToolResult("get_availability", callId, start, {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              date: result.date,
-              timezone: result.timezone,
-              booking_enabled: result.booking_enabled,
-              available_times: result.slots
-                .filter((s) => s.available)
-                .map((s) => s.time),
-            }),
-          },
-        ],
-      });
+      return logToolResult(
+        "get_availability",
+        callId,
+        start,
+        {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                date: result.date,
+                timezone: result.timezone,
+                booking_enabled: result.booking_enabled,
+                available_times: result.slots
+                  .filter((s) => s.available)
+                  .map((s) => s.time),
+              }),
+            },
+          ],
+        },
+        conversationId,
+      );
     },
   );
 }
@@ -237,10 +304,17 @@ function registerCreateBooking(
       customer_name: string;
       customer_phone: string;
       confirmed: boolean;
-    }) => {
+    }, extra) => {
       const start = Date.now();
+      const conversationId = readConversationId(extra);
       if (config === undefined || agenda === undefined) {
-        return logToolResult("create_booking", callId, start, toolError());
+        return logToolResult(
+          "create_booking",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
       }
 
       // Deterministic, server-side idempotency key over the request fields
@@ -279,25 +353,43 @@ function registerCreateBooking(
       );
 
       if (result.kind === "confirmed") {
-        return logToolResult("create_booking", callId, start, {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                status: "confirmed",
-                booking_id: result.booking_id,
-                service_id: result.service_id,
-                date: result.date,
-                time: result.time,
-              }),
-            },
-          ],
-        });
+        return logToolResult(
+          "create_booking",
+          callId,
+          start,
+          {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  status: "confirmed",
+                  booking_id: result.booking_id,
+                  service_id: result.service_id,
+                  date: result.date,
+                  time: result.time,
+                }),
+              },
+            ],
+          },
+          conversationId,
+        );
       }
       if (result.kind === "rejected") {
-        return logToolResult("create_booking", callId, start, toolError(result.code));
+        return logToolResult(
+          "create_booking",
+          callId,
+          start,
+          toolError(result.code),
+          conversationId,
+        );
       }
-      return logToolResult("create_booking", callId, start, toolError());
+      return logToolResult(
+        "create_booking",
+        callId,
+        start,
+        toolError(),
+        conversationId,
+      );
     },
   );
 }

@@ -236,3 +236,135 @@ describe("/webhooks/dynamic-variables — payload envelope and size", () => {
     expect(env.CONFIG.get).not.toHaveBeenCalled();
   });
 });
+
+describe("/webhooks/dynamic-variables — bounded KV wait", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  type PendingKv = KvMock & {
+    resolve: (v: unknown) => void;
+    reject: (e: unknown) => void;
+  };
+
+  function pendingKv(): PendingKv {
+    let resolveFn!: (v: unknown) => void;
+    let rejectFn!: (e: unknown) => void;
+    const promise = new Promise<unknown>((resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+    return {
+      get: vi.fn(() => promise),
+      resolve: resolveFn,
+      reject: rejectFn,
+    };
+  }
+
+  function captureUnhandled(): { list: unknown[]; off: () => void } {
+    const list: unknown[] = [];
+    const handler = (reason: unknown) => {
+      list.push(reason);
+    };
+    process.on("unhandledRejection", handler);
+    return {
+      list,
+      off: () => {
+        process.off("unhandledRejection", handler);
+      },
+    };
+  }
+
+  it("config resolves before deadline → uses config and logs config_outcome=ok", async () => {
+    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const promise = handler.fetch(
+      webhookReq(initPayload("+15550000001")),
+      env as never,
+    );
+    await vi.advanceTimersByTimeAsync(50);
+    const res = await promise;
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.system_status).toBe("ok");
+    expect(body.dynamic_variables.booking_enabled).toBe("true");
+    expect(body.dynamic_variables.service_list).toBe(
+      "Oil Change, Tire Rotation, General Maintenance Service",
+    );
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.config_outcome).toBe("ok");
+  });
+
+  it("config never resolves → degraded at the 800ms deadline with empty service_list", async () => {
+    const env = { CONFIG: pendingKv() };
+    const promise = handler.fetch(
+      webhookReq(initPayload("+15550000002")),
+      env as never,
+    );
+    await vi.advanceTimersByTimeAsync(799);
+    await vi.advanceTimersByTimeAsync(1);
+    const res = await promise;
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dynamic_variables: Record<string, string>;
+    };
+    expect(body.dynamic_variables.system_status).toBe("degraded");
+    expect(body.dynamic_variables.booking_enabled).toBe("false");
+    expect(body.dynamic_variables.service_list).toBe("");
+    const ev = findEvent("webhook.dynamic_variables");
+    expect(ev?.config_outcome).toBe("timeout");
+  });
+
+  it("config resolves after timeout → no second log, no unhandled rejection", async () => {
+    const kv = pendingKv();
+    const env = { CONFIG: kv };
+    const { list, off } = captureUnhandled();
+    try {
+      const promise = handler.fetch(
+        webhookReq(initPayload("+15550000003")),
+        env as never,
+      );
+      await vi.advanceTimersByTimeAsync(800);
+      const res = await promise;
+      expect(res.status).toBe(200);
+      const before = logEvents().filter(
+        (e) => e.event === "webhook.dynamic_variables",
+      ).length;
+      kv.resolve(VALID_CONFIG);
+      await vi.advanceTimersByTimeAsync(0);
+      await new Promise<void>((resolve) => process.nextTick(resolve));
+      const after = logEvents().filter(
+        (e) => e.event === "webhook.dynamic_variables",
+      ).length;
+      expect(after).toBe(before);
+      expect(list).toEqual([]);
+    } finally {
+      off();
+    }
+  });
+
+  it("config rejects after timeout → no unhandled rejection", async () => {
+    const kv = pendingKv();
+    const env = { CONFIG: kv };
+    const { list, off } = captureUnhandled();
+    try {
+      const promise = handler.fetch(
+        webhookReq(initPayload("+15550000004")),
+        env as never,
+      );
+      await vi.advanceTimersByTimeAsync(800);
+      const res = await promise;
+      expect(res.status).toBe(200);
+      kv.reject(new Error("late kv failure"));
+      await vi.advanceTimersByTimeAsync(0);
+      await new Promise<void>((resolve) => process.nextTick(resolve));
+      expect(list).toEqual([]);
+    } finally {
+      off();
+    }
+  });
+});

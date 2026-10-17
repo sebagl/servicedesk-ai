@@ -1162,3 +1162,270 @@ describe("/mcp — correlation id and rejection logging", () => {
     expect(events("mcp.rejected")[0]?.reason).toBe("origin_header");
   });
 });
+
+// ---------------------------------------------------------------------------
+// params._meta.telnyx_conversation_id — correlation only
+// ---------------------------------------------------------------------------
+
+describe("/mcp — telnyx_conversation_id correlation (params._meta)", () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  function toolCalls(name: string): Array<Record<string, unknown>> {
+    return logSpy.mock.calls
+      .map((call) => call[0])
+      .filter((s): s is string => typeof s === "string")
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .filter((e) => e.event === "mcp.tool_call" && e.tool === name);
+  }
+
+  function futureOpenDate(): string {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Mexico_City",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+    });
+    for (let i = 1; i <= 6; i++) {
+      const parts = fmt.formatToParts(new Date(Date.now() + i * 86_400_000));
+      const weekday = parts.find((p) => p.type === "weekday")!.value;
+      if (["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday)) {
+        const y = parts.find((p) => p.type === "year")!.value;
+        const m = parts.find((p) => p.type === "month")!.value;
+        const d = parts.find((p) => p.type === "day")!.value;
+        return `${y}-${m}-${d}`;
+      }
+    }
+    throw new Error("no open weekday within booking window");
+  }
+
+  function catalogCallWithMeta(meta: unknown): Request {
+    return mcpRequest(
+      jsonRpcBody(1, "tools/call", {
+        name: "get_service_catalog",
+        arguments: {},
+        _meta: meta,
+      }),
+      mcpHeaders(VALID_TOKEN),
+    );
+  }
+
+  function availabilityCallWithMeta(date: string, meta: unknown): Request {
+    return mcpRequest(
+      jsonRpcBody(1, "tools/call", {
+        name: "get_availability",
+        arguments: { date },
+        _meta: meta,
+      }),
+      mcpHeaders(VALID_TOKEN),
+    );
+  }
+
+  function bookingCallWithMeta(args: unknown, meta: unknown): Request {
+    return mcpRequest(
+      jsonRpcBody(1, "tools/call", {
+        name: "create_booking",
+        arguments: args,
+        _meta: meta,
+      }),
+      mcpHeaders(VALID_TOKEN),
+    );
+  }
+
+  it("logs a valid telnyx_conversation_id for get_service_catalog", async () => {
+    await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: "conv:v3:abc_DEF-123" }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = toolCalls("get_service_catalog");
+    expect(ev?.telnyx_conversation_id).toBe("conv:v3:abc_DEF-123");
+    expect(ev?.call_control_id).toBe("");
+  });
+
+  it("logs a valid telnyx_conversation_id for get_availability", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const agenda = {
+      idFromName: vi.fn(() => ({
+        getOccupiedSlots: vi.fn(async () => ({ occupied: [] })),
+      })),
+    };
+    await handler.fetch(
+      availabilityCallWithMeta(futureOpenDate(), {
+        telnyx_conversation_id: "conv-AZ_09",
+      }),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    const [ev] = toolCalls("get_availability");
+    expect(ev?.telnyx_conversation_id).toBe("conv-AZ_09");
+  });
+
+  it("logs a valid telnyx_conversation_id for create_booking without altering input", async () => {
+    const captured: Array<Record<string, unknown>> = [];
+    const agenda = {
+      idFromName: vi.fn(() => ({
+        createBooking: vi.fn(async (input: CreateBookingInput) => {
+          captured.push({ ...input });
+          return {
+            ok: true,
+            booking_id: "bid-meta",
+            service_id: input.service_id,
+            date: input.date,
+            time: input.time,
+            status: "confirmed",
+          };
+        }),
+      })),
+    };
+    const kv = validKv(VALID_CONFIG);
+    const args = {
+      service_id: "oil_change",
+      date: futureOpenDate(),
+      time: "10:00",
+      customer_name: "Alice",
+      customer_phone: "+5215512345678",
+      confirmed: true,
+    };
+
+    const res = await handler.fetch(
+      bookingCallWithMeta(args, {
+        telnyx_conversation_id: "conv-1234:abc",
+      }),
+      { SECRETS: validSecrets(), CONFIG: kv, AGENDA: agenda } as never,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBeFalsy();
+    const parsed = JSON.parse(body.result.content[0]!.text) as {
+      booking_id: string;
+    };
+    expect(parsed.booking_id).toBe("bid-meta");
+
+    const [ev] = toolCalls("create_booking");
+    expect(ev?.telnyx_conversation_id).toBe("conv-1234:abc");
+
+    // Metadata must not change what reaches the Actor.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.service_id).toBe("oil_change");
+    expect(captured[0]!.date).toBe(args.date);
+    expect(captured[0]!.time).toBe("10:00");
+    expect(captured[0]!.customer_name).toBe("Alice");
+    expect(captured[0]!.customer_phone).toBe("+5215512345678");
+    expect(captured[0]!.confirmed).toBe(true);
+    expect((captured[0] as Record<string, unknown>).telnyx_conversation_id).toBeUndefined();
+    expect(typeof captured[0]!.idempotency_key).toBe("string");
+  });
+
+  it("omits the field when _meta is missing entirely", async () => {
+    await handler.fetch(
+      catalogCallWithMeta(undefined),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = toolCalls("get_service_catalog");
+    expect(ev).toBeDefined();
+    expect("telnyx_conversation_id" in (ev as object)).toBe(false);
+  });
+
+  it("omits the field when the value is not a string", async () => {
+    await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: 12345 }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev1] = toolCalls("get_service_catalog");
+    expect("telnyx_conversation_id" in (ev1 as object)).toBe(false);
+
+    await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: { nested: "x" } }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const calls = toolCalls("get_service_catalog");
+    const ev2 = calls[calls.length - 1];
+    expect("telnyx_conversation_id" in (ev2 as object)).toBe(false);
+
+    await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: null }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const calls2 = toolCalls("get_service_catalog");
+    const ev3 = calls2[calls2.length - 1];
+    expect("telnyx_conversation_id" in (ev3 as object)).toBe(false);
+  });
+
+  it("omits the field when the value exceeds 128 characters", async () => {
+    const tooLong = "a".repeat(129);
+    await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: tooLong }),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = toolCalls("get_service_catalog");
+    expect("telnyx_conversation_id" in (ev as object)).toBe(false);
+  });
+
+  it("omits the field when the value contains disallowed characters", async () => {
+    const cases = [
+      "has space",
+      "has/slash",
+      'has"quote',
+      "has{brace}",
+      "has\nnewline",
+      "",
+    ];
+    for (const value of cases) {
+      await handler.fetch(
+        catalogCallWithMeta({ telnyx_conversation_id: value }),
+        fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+      );
+    }
+    const calls = toolCalls("get_service_catalog");
+    expect(calls).toHaveLength(cases.length);
+    for (const ev of calls) {
+      expect("telnyx_conversation_id" in (ev as object)).toBe(false);
+    }
+  });
+
+  it("does not alter tool results when metadata is invalid", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const res1 = await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: "valid-id_42" }),
+      fullEnv(validSecrets(), kv) as never,
+    );
+    const res2 = await handler.fetch(
+      catalogCallWithMeta({ telnyx_conversation_id: "bad value" }),
+      fullEnv(validSecrets(), kv) as never,
+    );
+    expect(res1.status).toBe(res2.status);
+    const body1 = (await res1.json()) as {
+      result: { content: Array<{ text: string }> };
+    };
+    const body2 = (await res2.json()) as {
+      result: { content: Array<{ text: string }> };
+    };
+    expect(body1.result.content[0]!.text).toBe(body2.result.content[0]!.text);
+  });
+
+  it("keeps call_control_id separate from telnyx_conversation_id", async () => {
+    await handler.fetch(
+      mcpRequest(
+        jsonRpcBody(1, "tools/call", {
+          name: "get_service_catalog",
+          arguments: {},
+          _meta: { telnyx_conversation_id: "conv-XYZ" },
+        }),
+        mcpHeaders(VALID_TOKEN, { "x-call-control-id": "call-999" }),
+      ),
+      fullEnv(validSecrets(), validKv(VALID_CONFIG)) as never,
+    );
+    const [ev] = toolCalls("get_service_catalog");
+    expect(ev?.call_control_id).toBe("call-999");
+    expect(ev?.telnyx_conversation_id).toBe("conv-XYZ");
+  });
+});

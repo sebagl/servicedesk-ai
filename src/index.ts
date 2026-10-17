@@ -11,7 +11,7 @@ import {
   type KvNamespace,
 } from "@telnyx/edge-runtime";
 
-import { loadConfig, type AppConfig } from "./config";
+import { loadConfig, type AppConfig, type ConfigResult } from "./config";
 import { getAvailability, validateDateParam } from "./availability";
 import { handleBookingRequest, readBoundedBody } from "./bookings";
 import { handleMcpRequest } from "./mcp-server";
@@ -93,6 +93,28 @@ const WEEKDAY_NAMES = [
 // NOTE: Telnyx request signature verification is a planned follow-up; the
 // endpoint is currently unauthenticated because it returns only non-sensitive
 // business info.
+
+// Cap on how long the dynamic-variables webhook will wait for KV config. A
+// slow KV must not stall the 200 the caller expects at assistant init.
+const CONFIG_WAIT_MS = 800;
+
+// Race loadConfig against a fixed deadline so the webhook cannot hang on a
+// slow KV. A late resolution is discarded; a late rejection is caught so it
+// cannot escape as an unhandled promise rejection.
+async function loadConfigBounded(
+  kv: KvNamespace,
+): Promise<ConfigResult | "timeout"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const configPromise = loadConfig(kv).catch(
+    (): ConfigResult => ({ ok: false }),
+  );
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), CONFIG_WAIT_MS);
+  });
+  const outcome = await Promise.race([configPromise, timeoutPromise]);
+  if (timer !== undefined) clearTimeout(timer);
+  return outcome;
+}
 async function handleDynamicVariables(
   req: Request,
   env: Env,
@@ -153,13 +175,20 @@ async function handleDynamicVariables(
   let bookingEnabled = false;
   let serviceList = "";
   let systemStatus = "ok";
+  let configOutcome: "ok" | "timeout" | "load_failed" | "absent" = "ok";
   if (env.CONFIG === undefined) {
+    configOutcome = "absent";
     systemStatus = "degraded";
   } else {
-    const cfgResult = await loadConfig(env.CONFIG);
-    if (!cfgResult.ok) {
+    const cfgResult = await loadConfigBounded(env.CONFIG);
+    if (cfgResult === "timeout") {
+      configOutcome = "timeout";
+      systemStatus = "degraded";
+    } else if (!cfgResult.ok) {
+      configOutcome = "load_failed";
       systemStatus = "degraded";
     } else {
+      configOutcome = "ok";
       bookingEnabled = cfgResult.config.business.booking_enabled;
       serviceList = cfgResult.config.services
         .map((s) => s.name)
@@ -182,6 +211,7 @@ async function handleDynamicVariables(
     assistant_id: assistantId,
     system_status: systemStatus,
     booking_enabled: bookingEnabled ? "true" : "false",
+    config_outcome: configOutcome,
     latency_ms: Date.now() - start,
   });
 
