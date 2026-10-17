@@ -31,6 +31,14 @@ id = "533e7681-de0d-4af6-bf4d-1da671f7f5d3"
 binding = "SMOKE_AUTH"
 name    = "SMOKE_TEST_TOKEN"
 
+# MCP endpoint bearer token for /mcp. Distinct from SMOKE_AUTH so revocation
+# scopes to one surface; stored independently of TELNYX_API_KEY:
+#   `telnyx-edge secrets add MCP_API_TOKEN <value>`.
+# Local `dev` does not emulate secrets — /mcp fails closed (503) without it.
+[[secrets]]
+binding = "MCP_AUTH"
+name    = "MCP_API_TOKEN"
+
 # Registered via `telnyx-edge new-func --actor` (2026-10-16).
 # Required for `ship`; `dev` and `types` do not need it.
 [edge_compute]

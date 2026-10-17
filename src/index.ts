@@ -14,6 +14,7 @@ import {
 import { loadConfig, type AppConfig } from "./config";
 import { getAvailability, validateDateParam } from "./availability";
 import { handleBookingRequest } from "./bookings";
+import { handleMcpRequest } from "./mcp-server";
 
 type CounterStub = ActorStub & Pick<Counter, "increment" | "read">;
 interface CounterNamespace extends ActorNamespace {
@@ -57,6 +58,16 @@ async function getSmokeToken(env: Env): Promise<string | null> {
   }
 }
 
+async function getMcpToken(env: Env): Promise<string | null> {
+  if (!env.SECRETS) return null;
+  try {
+    const token = await env.SECRETS.get("MCP_AUTH");
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -66,6 +77,27 @@ export default {
     }
     if (url.pathname === "/health/liveness") return new Response("ok");
     if (url.pathname === "/health/readiness") return new Response("ok");
+
+    // --- /mcp — server-to-server, auth-gated, browser Origin rejected ---
+    if (url.pathname === "/mcp") {
+      // Server-to-server MVP — refuse browser-originated traffic before any
+      // secret read or protocol handling.
+      if (req.headers.get("origin") !== null) {
+        return new Response("not found", { status: 404 });
+      }
+
+      const token = await getMcpToken(env);
+      if (token === null) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+
+      const credential = extractBearer(req);
+      if (credential === null || !constantTimeEqual(credential, token)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+
+      return handleMcpRequest(req, env.CONFIG);
+    }
 
     // --- Demo routes (smoke-test only, auth-gated) ---
     const isDemoConfig = url.pathname === "/demo/config";

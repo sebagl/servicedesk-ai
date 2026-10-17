@@ -8,7 +8,7 @@ declare global {
     COUNTER: __TelnyxActorNamespace<Counter>;
     AGENDA: __TelnyxActorNamespace<DayAgenda>;
     CONFIG: __TelnyxKvNamespace;
-    SECRETS: { get(binding: "SMOKE_AUTH"): Promise<string> };
+    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH"): Promise<string> };
   }
 }
 
@@ -17,7 +17,7 @@ declare module "@telnyx/edge-runtime" {
     COUNTER: __TelnyxActorNamespace<Counter>;
     AGENDA: __TelnyxActorNamespace<DayAgenda>;
     CONFIG: __TelnyxKvNamespace;
-    SECRETS: { get(binding: "SMOKE_AUTH"): Promise<string> };
+    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH"): Promise<string> };
   }
 }
 

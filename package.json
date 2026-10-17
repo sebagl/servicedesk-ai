@@ -10,7 +10,9 @@
     "build": "tsc --noEmit"
   },
   "dependencies": {
-    "@telnyx/edge-runtime": "0.16.0"
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@telnyx/edge-runtime": "0.16.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
