@@ -40,14 +40,14 @@ export type BookingResponse =
 export async function readBoundedBody(
   req: Request,
 ): Promise<
-  | { ok: true; text: string }
+  | { ok: true; text: string; raw: Uint8Array }
   | { ok: false; status: 400 }
   | { ok: false; status: 413 }
 > {
   const reader = req.body?.getReader();
   if (!reader) {
     // No body stream — treat as empty (will fail JSON parse later).
-    return { ok: true, text: "" };
+    return { ok: true, text: "", raw: new Uint8Array(0) };
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -76,7 +76,17 @@ export async function readBoundedBody(
     const text =
       chunks.map((c) => decoder.decode(c, { stream: true })).join("") +
       decoder.decode();
-    return { ok: true, text };
+    // Concatenate the exact bytes Telnyx signed — building from the chunks
+    // (not from the decoded text) keeps the byte sequence identical for the
+    // signature verifier, including any non-UTF-8 / non-canonical form a
+    // re-encoder would have lost.
+    const raw = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      raw.set(c, offset);
+      offset += c.byteLength;
+    }
+    return { ok: true, text, raw };
   } finally {
     // The reader lock is NOT released by cancel() or by read() returning
     // done. releaseLock() must be called explicitly. We do NOT await

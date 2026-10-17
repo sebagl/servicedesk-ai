@@ -9,7 +9,7 @@ declare global {
     AGENDA: __TelnyxActorNamespace<DayAgenda>;
     CONVERSATION_BOOKING: __TelnyxActorNamespace<ConversationBooking>;
     CONFIG: __TelnyxKvNamespace;
-    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH"): Promise<string> };
+    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH" | "WEBHOOK_PUBLIC_KEY"): Promise<string> };
   }
 }
 
@@ -19,7 +19,7 @@ declare module "@telnyx/edge-runtime" {
     AGENDA: __TelnyxActorNamespace<DayAgenda>;
     CONVERSATION_BOOKING: __TelnyxActorNamespace<ConversationBooking>;
     CONFIG: __TelnyxKvNamespace;
-    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH"): Promise<string> };
+    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH" | "WEBHOOK_PUBLIC_KEY"): Promise<string> };
   }
 }
 

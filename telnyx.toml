@@ -46,6 +46,16 @@ name    = "SMOKE_TEST_TOKEN"
 binding = "MCP_AUTH"
 name    = "MCP_API_TOKEN"
 
+# Ed25519 public key (base64, 32 bytes) used to verify Telnyx webhook
+# signatures on /webhooks/dynamic-variables. Telnyx signs each delivery with
+# `${timestamp}|${rawBody}`; the private side lives in Mission Control.
+# Stored independently of TELNYX_API_KEY:
+#   `telnyx-edge secrets add TELNYX_PUBLIC_KEY <base64-32-bytes>`.
+# Local `dev` does not emulate secrets — the webhook fails closed (503) without it.
+[[secrets]]
+binding = "WEBHOOK_PUBLIC_KEY"
+name    = "TELNYX_PUBLIC_KEY"
+
 # Registered via `telnyx-edge new-func --actor` (2026-10-16).
 # Required for `ship`; `dev` and `types` do not need it.
 [edge_compute]

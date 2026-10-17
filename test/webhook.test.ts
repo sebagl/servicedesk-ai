@@ -30,7 +30,61 @@ const VALID_CONFIG: AppConfig = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Key pair + signing — a fresh Ed25519 key per test so no state leaks across
+// cases. The signer mirrors Telnyx's canonical form:
+// UTF-8(`${timestamp}|`) || exact raw body bytes.
+// ---------------------------------------------------------------------------
+
+interface KeyPair {
+  publicKeyBase64: string;
+  privateKey: CryptoKey;
+}
+
+async function generateKeyPair(): Promise<KeyPair> {
+  const kp = await crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  );
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  return {
+    publicKeyBase64: bytesToBase64(raw),
+    privateKey: kp.privateKey,
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
+  return btoa(bin);
+}
+
+async function signBody(
+  privateKey: CryptoKey,
+  timestamp: number | string,
+  body: Uint8Array,
+): Promise<string> {
+  const prefix = new TextEncoder().encode(`${timestamp}|`);
+  const msg = new Uint8Array(prefix.length + body.length);
+  msg.set(prefix, 0);
+  msg.set(body, prefix.length);
+  const sig = await crypto.subtle.sign("Ed25519", privateKey, msg);
+  return bytesToBase64(new Uint8Array(sig));
+}
+
+// ---------------------------------------------------------------------------
+// KV + SECRETS mocks. Each test gets a fresh keypair and a default-env helper
+// so a request signed with the test's key validates against the matching
+// SECRETS mock without any per-test plumbing.
+// ---------------------------------------------------------------------------
+
 type KvMock = { get: ReturnType<typeof vi.fn> };
+type SecretsMock = { get: ReturnType<typeof vi.fn> };
+interface WebhookEnv {
+  CONFIG?: KvMock;
+  SECRETS?: SecretsMock;
+}
 
 function validKv(config: unknown): KvMock {
   return { get: vi.fn(async () => config) };
@@ -44,11 +98,148 @@ function rejectingKv(): KvMock {
   };
 }
 
-function webhookReq(body: string | undefined, method = "POST"): Request {
+function secretsEnv(publicKeyBase64: string, kv?: KvMock): WebhookEnv {
+  const secrets: SecretsMock = {
+    get: vi.fn(async (binding: string) => {
+      if (binding === "WEBHOOK_PUBLIC_KEY") return publicKeyBase64;
+      throw new Error(`unexpected binding: ${binding}`);
+    }),
+  };
+  return kv === undefined ? { SECRETS: secrets } : { CONFIG: kv, SECRETS: secrets };
+}
+
+function invalidKeySecrets(kv?: KvMock): WebhookEnv {
+  // 16 bytes (too short for Ed25519) — surfaces as invalid_configuration in
+  // the verifier. The handler must report a generic 503, never parse or
+  // reach KV.
+  const tooShort = bytesToBase64(new Uint8Array(16));
+  const secrets: SecretsMock = {
+    get: vi.fn(async (binding: string) => {
+      if (binding === "WEBHOOK_PUBLIC_KEY") return tooShort;
+      throw new Error(`unexpected binding: ${binding}`);
+    }),
+  };
+  return kv === undefined ? { SECRETS: secrets } : { CONFIG: kv, SECRETS: secrets };
+}
+
+function rejectingSecrets(kv?: KvMock): WebhookEnv {
+  const secrets: SecretsMock = {
+    get: vi.fn(async () => {
+      throw new Error("secret store down");
+    }),
+  };
+  return kv === undefined ? { SECRETS: secrets } : { CONFIG: kv, SECRETS: secrets };
+}
+
+interface PendingSecrets {
+  env: WebhookEnv;
+  resolve: (value: string) => void;
+  reject: (reason: unknown) => void;
+}
+
+function pendingSecrets(kv?: KvMock): PendingSecrets {
+  let resolveFn!: (v: string) => void;
+  let rejectFn!: (e: unknown) => void;
+  const promise = new Promise<string>((resolve, reject) => {
+    resolveFn = resolve;
+    rejectFn = reject;
+  });
+  const secrets: SecretsMock = {
+    get: vi.fn((binding: string) => {
+      if (binding === "WEBHOOK_PUBLIC_KEY") return promise;
+      return Promise.reject(new Error(`unexpected binding: ${binding}`));
+    }),
+  };
+  return {
+    env: kv === undefined ? { SECRETS: secrets } : { CONFIG: kv, SECRETS: secrets },
+    resolve: resolveFn,
+    reject: rejectFn,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Request builder — auto-signs with the current keypair and the current
+// "now". Tamper / omit / override options cover the rejection cases.
+// ---------------------------------------------------------------------------
+
+let keyPair: KeyPair;
+
+interface WebhookReqOptions {
+  method?: string;
+  // Sign one body, send a different one — exercises the byte-level check.
+  tamperBody?: string;
+  // Override the timestamp header sent on the wire.
+  timestampHeader?: number | string;
+  // Override the signature header sent on the wire. null → header omitted.
+  signatureHeader?: string | null;
+  omitSignature?: boolean;
+  omitTimestamp?: boolean;
+  // Sign with a different key (e.g. wrong-key tests).
+  privateKey?: CryptoKey;
+  // Build the request body from raw bytes instead of a UTF-8 string.
+  rawBody?: Uint8Array;
+  // Stream a large body that exceeds 10 KiB without Content-Length.
+  largeBody?: Uint8Array;
+  extraHeaders?: Record<string, string>;
+}
+
+async function webhookReq(
+  body?: string,
+  opts: WebhookReqOptions = {},
+): Promise<Request> {
+  const ts = opts.timestampHeader ?? Math.floor(Date.now() / 1000);
+  const tsString = String(ts);
+  let bytes: Uint8Array;
+  if (opts.rawBody !== undefined) bytes = opts.rawBody;
+  else if (body !== undefined) bytes = new TextEncoder().encode(body);
+  else bytes = new Uint8Array(0);
+
+  const signingKey = opts.privateKey ?? keyPair.privateKey;
+  const signature = await signBody(signingKey, tsString, bytes);
+
+  // The wire body that goes into the Request. readBoundedBody reads it back
+  // as raw bytes and feeds them to the signature verifier — sending as a
+  // string (instead of Uint8Array) keeps the test type system happy and is
+  // byte-equivalent for ASCII/UTF-8 inputs.
+  const sendBody =
+    opts.tamperBody !== undefined ? opts.tamperBody : body ?? "";
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (!opts.omitTimestamp) headers["telnyx-timestamp"] = tsString;
+  if (opts.signatureHeader !== null && !opts.omitSignature) {
+    headers["telnyx-signature-ed25519"] =
+      opts.signatureHeader ?? signature;
+  }
+  if (opts.extraHeaders) Object.assign(headers, opts.extraHeaders);
+
+  if (opts.largeBody !== undefined) {
+    const big = opts.largeBody;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(big);
+        controller.close();
+      },
+    });
+    return new Request("http://x/webhooks/dynamic-variables", {
+      method: opts.method ?? "POST",
+      body: stream,
+      headers,
+      duplex: "half",
+    } as RequestInit);
+  }
+
+  const method = opts.method ?? "POST";
+  // GET / HEAD cannot carry a body — strip it so the Request constructor
+  // accepts the call. The method-not-allowed test only cares about the
+  // method; the body, if any, would be discarded upstream.
+  const useBody = method === "GET" || method === "HEAD" ? undefined : sendBody;
+
   return new Request("http://x/webhooks/dynamic-variables", {
     method,
-    body,
-    headers: { "content-type": "application/json" },
+    body: useBody,
+    headers,
   });
 }
 
@@ -67,8 +258,9 @@ function initPayload(phone: string): string {
 
 let logSpy: ReturnType<typeof vi.spyOn>;
 
-beforeEach(() => {
+beforeEach(async () => {
   logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  keyPair = await generateKeyPair();
 });
 
 afterEach(() => {
@@ -88,9 +280,9 @@ function findEvent(name: string): Record<string, unknown> | undefined {
 
 describe("/webhooks/dynamic-variables — shape", () => {
   it("POST with valid config returns full dynamic_variables payload", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000001")),
+      await webhookReq(initPayload("+15550000001")),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -119,9 +311,9 @@ describe("/webhooks/dynamic-variables — shape", () => {
   });
 
   it("config failure → 200 degraded with booking_enabled 'false' and empty service_list", async () => {
-    const env = { CONFIG: rejectingKv() };
+    const env = secretsEnv(keyPair.publicKeyBase64, rejectingKv());
     const res = await handler.fetch(
-      webhookReq(JSON.stringify({ data: { event_type: "x", payload: {} } })),
+      await webhookReq(JSON.stringify({ data: { event_type: "x", payload: {} } })),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -134,25 +326,26 @@ describe("/webhooks/dynamic-variables — shape", () => {
     expect(body.dynamic_variables.business_hours).toBe("");
   });
 
-  it("invalid JSON → 400", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
-    const res = await handler.fetch(webhookReq("not json"), env as never);
+  it("signed malformed JSON → 400", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res = await handler.fetch(await webhookReq("not json"), env as never);
     expect(res.status).toBe(400);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
   });
 
   it("GET → 405", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const res = await handler.fetch(
-      webhookReq(undefined, "GET"),
+      await webhookReq(undefined, { method: "GET" }),
       env as never,
     );
     expect(res.status).toBe(405);
   });
 
   it("missing payload fields are not an error — still 200", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const res = await handler.fetch(
-      webhookReq(JSON.stringify({ data: {} })),
+      await webhookReq(JSON.stringify({ data: {} })),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -176,9 +369,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
         open_days: ["mon", "wed", "fri"],
       },
     };
-    const env = { CONFIG: validKv(config) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(config));
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000010")),
+      await webhookReq(initPayload("+15550000010")),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -198,9 +391,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
         open_days: ["fri", "mon", "wed"],
       },
     };
-    const env = { CONFIG: validKv(config) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(config));
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000011")),
+      await webhookReq(initPayload("+15550000011")),
       env as never,
     );
     const body = (await res.json()) as {
@@ -219,9 +412,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
         open_days: ["sat", "sun"],
       },
     };
-    const env = { CONFIG: validKv(config) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(config));
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000012")),
+      await webhookReq(initPayload("+15550000012")),
       env as never,
     );
     const body = (await res.json()) as {
@@ -240,9 +433,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
         open_days: ["wed"],
       },
     };
-    const env = { CONFIG: validKv(config) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(config));
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000013")),
+      await webhookReq(initPayload("+15550000013")),
       env as never,
     );
     const body = (await res.json()) as {
@@ -254,9 +447,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
   });
 
   it("CONFIG binding absent → degraded with empty business_hours", async () => {
-    const env = {} as never;
+    const env = secretsEnv(keyPair.publicKeyBase64);
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000014")),
+      await webhookReq(initPayload("+15550000014")),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -276,9 +469,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
         open_days: ["mon", "funday"],
       },
     };
-    const env = { CONFIG: validKv(bad) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(bad));
     const res = await handler.fetch(
-      webhookReq(initPayload("+15550000015")),
+      await webhookReq(initPayload("+15550000015")),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -293,9 +486,9 @@ describe("/webhooks/dynamic-variables — business_hours announcement", () => {
 
 describe("/webhooks/dynamic-variables — logging", () => {
   it("log line contains masked phone and never the full number", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const fullPhone = "+15550000001";
-    await handler.fetch(webhookReq(initPayload(fullPhone)), env as never);
+    await handler.fetch(await webhookReq(initPayload(fullPhone)), env as never);
     const ev = findEvent("webhook.dynamic_variables");
     expect(ev).toBeDefined();
     expect(ev!.caller).toBe("***0001");
@@ -324,9 +517,9 @@ describe("maskPhone", () => {
 
 describe("/webhooks/dynamic-variables — payload envelope and size", () => {
   it("accepts the event without a data envelope ({payload})", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(
+      await webhookReq(
         JSON.stringify({
           event_type: "assistant.initialization",
           payload: {
@@ -344,31 +537,24 @@ describe("/webhooks/dynamic-variables — payload envelope and size", () => {
   });
 
   it("rejects a body over 10 KiB with 413 even without Content-Length", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
-    const big = new TextEncoder().encode(
-      JSON.stringify({ payload: { pad: "x".repeat(11 * 1024) } }),
-    );
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(big);
-        controller.close();
-      },
-    });
-    const req = new Request("http://x/webhooks/dynamic-variables", {
-      method: "POST",
-      body: stream,
-      headers: { "content-type": "application/json" },
-      duplex: "half",
-    } as RequestInit);
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const big = new Uint8Array(11 * 1024);
+    const req = await webhookReq(undefined, { largeBody: big });
     const res = await handler.fetch(req, env as never);
     expect(res.status).toBe(413);
-    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(env.SECRETS!.get).not.toHaveBeenCalled();
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
   });
 });
 
 describe("/webhooks/dynamic-variables — bounded KV wait", () => {
   beforeEach(() => {
-    vi.useFakeTimers();
+    // Only fake the timers the handler actually schedules via setTimeout; let
+    // crypto.subtle and queueMicrotask use the real event loop so WebCrypto
+    // operations (used by the signature verifier) make progress.
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -407,13 +593,31 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
     };
   }
 
+  // Advance fake time in small steps until `predicate` returns true, so the
+  // handler can complete all async setup (body read, key lookup, signature
+  // verification) before its internal 800ms KV timer is even scheduled.
+  async function advanceUntil(
+    predicate: () => boolean,
+    stepMs = 50,
+    capMs = 5000,
+  ): Promise<void> {
+    let advanced = 0;
+    while (!predicate() && advanced < capMs) {
+      await vi.advanceTimersByTimeAsync(stepMs);
+      advanced += stepMs;
+    }
+  }
+
   it("config resolves before deadline → uses config and logs config_outcome=ok", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
-    const promise = handler.fetch(
-      webhookReq(initPayload("+15550000001")),
-      env as never,
-    );
-    await vi.advanceTimersByTimeAsync(50);
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    let resolved = false;
+    const promise = handler
+      .fetch(await webhookReq(initPayload("+15550000001")), env as never)
+      .then((r) => {
+        resolved = true;
+        return r;
+      });
+    await advanceUntil(() => resolved);
     const res = await promise;
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -429,13 +633,15 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
   });
 
   it("config never resolves → degraded at the 800ms deadline with empty service_list", async () => {
-    const env = { CONFIG: pendingKv() };
-    const promise = handler.fetch(
-      webhookReq(initPayload("+15550000002")),
-      env as never,
-    );
-    await vi.advanceTimersByTimeAsync(799);
-    await vi.advanceTimersByTimeAsync(1);
+    const env = secretsEnv(keyPair.publicKeyBase64, pendingKv());
+    let resolved = false;
+    const promise = handler
+      .fetch(await webhookReq(initPayload("+15550000002")), env as never)
+      .then((r) => {
+        resolved = true;
+        return r;
+      });
+    await advanceUntil(() => resolved);
     const res = await promise;
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -451,14 +657,17 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
 
   it("config resolves after timeout → no second log, no unhandled rejection", async () => {
     const kv = pendingKv();
-    const env = { CONFIG: kv };
+    const env = secretsEnv(keyPair.publicKeyBase64, kv);
     const { list, off } = captureUnhandled();
     try {
-      const promise = handler.fetch(
-        webhookReq(initPayload("+15550000003")),
-        env as never,
-      );
-      await vi.advanceTimersByTimeAsync(800);
+      let resolved = false;
+      const promise = handler
+        .fetch(await webhookReq(initPayload("+15550000003")), env as never)
+        .then((r) => {
+          resolved = true;
+          return r;
+        });
+      await advanceUntil(() => resolved);
       const res = await promise;
       expect(res.status).toBe(200);
       const before = logEvents().filter(
@@ -479,14 +688,17 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
 
   it("config rejects after timeout → no unhandled rejection", async () => {
     const kv = pendingKv();
-    const env = { CONFIG: kv };
+    const env = secretsEnv(keyPair.publicKeyBase64, kv);
     const { list, off } = captureUnhandled();
     try {
-      const promise = handler.fetch(
-        webhookReq(initPayload("+15550000004")),
-        env as never,
-      );
-      await vi.advanceTimersByTimeAsync(800);
+      let resolved = false;
+      const promise = handler
+        .fetch(await webhookReq(initPayload("+15550000004")), env as never)
+        .then((r) => {
+          resolved = true;
+          return r;
+        });
+      await advanceUntil(() => resolved);
       const res = await promise;
       expect(res.status).toBe(200);
       kv.reject(new Error("late kv failure"));
@@ -500,8 +712,8 @@ describe("/webhooks/dynamic-variables — bounded KV wait", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Early rejections — exactly one webhook.rejected log per case, no KV access,
-// no request body / phone / call id leaking into the structured log.
+// Early rejections — exactly one webhook.rejected log per case, no SECRETS /
+// CONFIG access, no request body / phone / call id leaking into the log.
 // ---------------------------------------------------------------------------
 
 describe("/webhooks/dynamic-variables — early rejection logging", () => {
@@ -509,15 +721,16 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     return logEvents().filter((e) => e.event === "webhook.rejected");
   }
 
-  it("GET → method_not_allowed at 405, Allow header preserved, no KV access", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+  it("GET → method_not_allowed at 405, Allow header preserved, no SECRETS/CONFIG access", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const res = await handler.fetch(
       new Request("http://x/webhooks/dynamic-variables", { method: "GET" }),
       env as never,
     );
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("POST");
-    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(env.SECRETS!.get).not.toHaveBeenCalled();
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
     expect(rejections()).toHaveLength(1);
     const ev = rejections()[0]!;
     expect(ev.reason).toBe("method_not_allowed");
@@ -530,26 +743,14 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     expect(serialized).not.toContain("5550001234");
   });
 
-  it("body over 10 KiB → payload_too_large at 413, no KV access", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
-    const big = new TextEncoder().encode(
-      JSON.stringify({ payload: { pad: "x".repeat(11 * 1024) } }),
-    );
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(big);
-        controller.close();
-      },
-    });
-    const req = new Request("http://x/webhooks/dynamic-variables", {
-      method: "POST",
-      body: stream,
-      headers: { "content-type": "application/json" },
-      duplex: "half",
-    } as RequestInit);
+  it("body over 10 KiB → payload_too_large at 413, no SECRETS/CONFIG access", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const big = new Uint8Array(11 * 1024);
+    const req = await webhookReq(undefined, { largeBody: big });
     const res = await handler.fetch(req, env as never);
     expect(res.status).toBe(413);
-    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(env.SECRETS!.get).not.toHaveBeenCalled();
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
     expect(rejections()).toHaveLength(1);
     const ev = rejections()[0]!;
     expect(ev.reason).toBe("payload_too_large");
@@ -560,8 +761,8 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     expect(serialized).not.toContain("pad");
   });
 
-  it("rejecting body stream → body_read_failed at 400, no KV access", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+  it("rejecting body stream → body_read_failed at 400, no SECRETS/CONFIG access", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.error(new Error("connection reset"));
@@ -575,7 +776,8 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     } as RequestInit);
     const res = await handler.fetch(req, env as never);
     expect(res.status).toBe(400);
-    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(env.SECRETS!.get).not.toHaveBeenCalled();
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
     expect(rejections()).toHaveLength(1);
     const ev = rejections()[0]!;
     expect(ev.reason).toBe("body_read_failed");
@@ -587,14 +789,11 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     expect(serialized).not.toContain("stack");
   });
 
-  it("invalid JSON → invalid_json at 400, no KV access", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
-    const res = await handler.fetch(
-      webhookReq("not json"),
-      env as never,
-    );
+  it("signed malformed JSON → invalid_json at 400, no CONFIG access", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res = await handler.fetch(await webhookReq("not json"), env as never);
     expect(res.status).toBe(400);
-    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
     expect(rejections()).toHaveLength(1);
     const ev = rejections()[0]!;
     expect(ev.reason).toBe("invalid_json");
@@ -603,7 +802,7 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
   });
 
   it("does not log the request body, headers, or unvalidated identifiers", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const sentinels = {
       phone: "+15559990PH0N",
       callerId: "cc-SENTINEL-CALLER",
@@ -613,19 +812,14 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
         '{"data":{"payload":{"telnyx_end_user_target":"+15559990PH0N","call_control_id":"cc-SENTINEL-CALLER","assistant_id":"asst-SENTINEL-ASSIST",BROKEN',
     };
     const res = await handler.fetch(
-      new Request("http://x/webhooks/dynamic-variables", {
-        method: "POST",
-        body: sentinels.rawBody,
-        headers: {
-          "content-type": "application/json",
-          "x-call-control-id": "cc-SENTINEL-CALLER",
-          authorization: sentinels.auth,
-        },
-      }),
+      await webhookReq(sentinels.rawBody, { extraHeaders: {
+        "x-call-control-id": "cc-SENTINEL-CALLER",
+        authorization: sentinels.auth,
+      } }),
       env as never,
     );
     expect(res.status).toBe(400);
-    expect(env.CONFIG.get).not.toHaveBeenCalled();
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
     expect(rejections()).toHaveLength(1);
     expect(rejections()[0]!.reason).toBe("invalid_json");
     const allSerialized = JSON.stringify(logEvents());
@@ -637,6 +831,296 @@ describe("/webhooks/dynamic-variables — early rejection logging", () => {
     expect(allSerialized).not.toContain(sentinels.rawBody);
     expect(allSerialized).not.toContain("BROKEN");
     expect(allSerialized).not.toContain("telnyx_end_user_target");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Signature verification — only an Ed25519 signature over the exact body
+// bytes, header strings, and within the timestamp window passes.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — signature verification", () => {
+  it("accepts a freshly signed JSON payload", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000100")),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a body byte change after signing (tampered body)", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    // Sign one body, send a different one.
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000101"), {
+        tamperBody: initPayload("+15550000199"),
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("invalid_signature");
+    expect(ev?.http_status).toBe(401);
+  });
+
+  it("rejects when the signature header is missing", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000102"), { omitSignature: true }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("invalid_signature");
+    expect(ev?.http_status).toBe(401);
+  });
+
+  it("rejects when the timestamp header is missing", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000103"), { omitTimestamp: true }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale timestamp (one day old)", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const stale = Math.floor(Date.now() / 1000) - 86_400;
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000104"), {
+        timestampHeader: stale,
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+  });
+
+  it("rejects a far-future timestamp", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const future = Math.floor(Date.now() / 1000) + 86_400;
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000105"), {
+        timestampHeader: future,
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+  });
+
+  it("rejects a signature produced by a different key", async () => {
+    const otherKeyPair = await generateKeyPair();
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000106"), {
+        privateKey: otherKeyPair.privateKey,
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+  });
+
+  it("rejection log does not leak the signature, key, or request body", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const sentinels = {
+      sig: "SIG-SENTINEL-ABCDEF",
+      body: "BODY-SENTINEL-PAYLOAD",
+      phone: "+15559999SIG",
+    };
+    const res = await handler.fetch(
+      await webhookReq(initPayload(sentinels.phone), {
+        signatureHeader: sentinels.sig,
+        tamperBody: sentinels.body,
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    const allLogs = JSON.stringify(logEvents());
+    expect(allLogs).not.toContain(sentinels.sig);
+    expect(allLogs).not.toContain(sentinels.body);
+    expect(allLogs).not.toContain(sentinels.phone);
+    expect(allLogs).not.toContain(keyPair.publicKeyBase64);
+    expect(allLogs).not.toContain("telnyx-signature-ed25519");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Secret binding — missing / rejecting / timing out the secrets lookup must
+// fail closed (503) without leaking the reason, and must not touch KV.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — secret key binding", () => {
+  it("503 when SECRETS binding is absent", async () => {
+    const env: WebhookEnv = { CONFIG: validKv(VALID_CONFIG) };
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000200")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json())).toEqual({ error: "service_unavailable" });
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_unavailable");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("503 when the key read rejects", async () => {
+    const env = rejectingSecrets(validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000201")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_unavailable");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("503 when the stored key is not a valid Ed25519 public key", async () => {
+    const env = invalidKeySecrets(validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000202")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_unavailable");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("503 when the key read resolves to an empty string", async () => {
+    const secrets: SecretsMock = {
+      get: vi.fn(async (binding: string) => {
+        if (binding === "WEBHOOK_PUBLIC_KEY") return "";
+        throw new Error(`unexpected binding: ${binding}`);
+      }),
+    };
+    const env: WebhookEnv = { CONFIG: validKv(VALID_CONFIG), SECRETS: secrets };
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000203")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect(env.CONFIG!.get).not.toHaveBeenCalled();
+  });
+
+    describe("key read never settles (200ms deadline)", () => {
+    beforeEach(() => {
+      vi.useFakeTimers({
+        toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+      });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function captureUnhandled(): { list: unknown[]; off: () => void } {
+      const list: unknown[] = [];
+      const handler = (reason: unknown) => {
+        list.push(reason);
+      };
+      process.on("unhandledRejection", handler);
+      return {
+        list,
+        off: () => {
+          process.off("unhandledRejection", handler);
+        },
+      };
+    }
+
+    // Advance fake time until the handler completes (or the cap is hit) so
+    // a slow body read or signature verification cannot leave a scheduled
+    // timer stranded past our 200ms window.
+    async function advanceUntilResolved<T>(
+      promise: Promise<T>,
+      stepMs = 25,
+      capMs = 5000,
+    ): Promise<void> {
+      let advanced = 0;
+      while (advanced < capMs) {
+        const settled = await Promise.race([
+          promise.then(() => true, () => true),
+          Promise.resolve(false),
+        ]);
+        if (settled) return;
+        await vi.advanceTimersByTimeAsync(stepMs);
+        advanced += stepMs;
+      }
+    }
+
+    it("times out at 200ms → 503, no CONFIG access, no unhandled rejection", async () => {
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      let resolved = false;
+      const promise = handler
+        .fetch(await webhookReq(initPayload("+15550000204")), ps.env as never)
+        .then((r) => {
+          resolved = true;
+          return r;
+        });
+      await advanceUntilResolved(promise);
+      const res = await promise;
+      expect(res.status).toBe(503);
+      expect((await res.json())).toEqual({ error: "service_unavailable" });
+      expect(ps.env.CONFIG!.get).not.toHaveBeenCalled();
+      const ev = findEvent("webhook.rejected");
+      expect(ev?.reason).toBe("key_unavailable");
+      expect(ev?.http_status).toBe(503);
+      expect(resolved).toBe(true);
+    });
+
+    it("key resolves after timeout → no extra log, no CONFIG read, no unhandled rejection", async () => {
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const { list, off } = captureUnhandled();
+      try {
+        const promise = handler.fetch(
+          await webhookReq(initPayload("+15550000205")),
+          ps.env as never,
+        );
+        await advanceUntilResolved(promise);
+        const res = await promise;
+        expect(res.status).toBe(503);
+        ps.resolve(keyPair.publicKeyBase64);
+        await vi.advanceTimersByTimeAsync(0);
+        await new Promise<void>((resolve) => process.nextTick(resolve));
+        expect(ps.env.CONFIG!.get).not.toHaveBeenCalled();
+        const rejections = logEvents().filter(
+          (e) => e.event === "webhook.rejected",
+        );
+        expect(rejections).toHaveLength(1);
+        expect(list).toEqual([]);
+      } finally {
+        off();
+      }
+    });
+
+    it("key rejects after timeout → no unhandled rejection", async () => {
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const { list, off } = captureUnhandled();
+      try {
+        const promise = handler.fetch(
+          await webhookReq(initPayload("+15550000206")),
+          ps.env as never,
+        );
+        await advanceUntilResolved(promise);
+        const res = await promise;
+        expect(res.status).toBe(503);
+        ps.reject(new Error("late secret failure"));
+        await vi.advanceTimersByTimeAsync(0);
+        await new Promise<void>((resolve) => process.nextTick(resolve));
+        expect(list).toEqual([]);
+      } finally {
+        off();
+      }
+    });
   });
 });
 
@@ -665,9 +1149,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
   }
 
   it("preserves valid ids that match the bounded charset", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(payloadWithIds("cc-abc-123", "asst-xyz")),
+      await webhookReq(payloadWithIds("cc-abc-123", "asst-xyz")),
       env as never,
     );
     const ev = findEvent("webhook.dynamic_variables");
@@ -677,9 +1161,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
 
   it("preserves valid ids at the 128-char boundary", async () => {
     const id128 = "a".repeat(128);
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(payloadWithIds(id128, id128)),
+      await webhookReq(payloadWithIds(id128, id128)),
       env as never,
     );
     const ev = findEvent("webhook.dynamic_variables");
@@ -689,9 +1173,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
 
   it("replaces oversized ids (>128 chars) with empty string", async () => {
     const id129 = "a".repeat(129);
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const res = await handler.fetch(
-      webhookReq(payloadWithIds(id129, id129)),
+      await webhookReq(payloadWithIds(id129, id129)),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -704,9 +1188,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
 
   it("replaces whitespace and control characters with empty string", async () => {
     const bad = "cc with spaces\ncc\tctrl";
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(payloadWithIds(bad, bad)),
+      await webhookReq(payloadWithIds(bad, bad)),
       env as never,
     );
     const ev = findEvent("webhook.dynamic_variables");
@@ -718,9 +1202,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
   });
 
   it("replaces email-like values with empty string", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(payloadWithIds("attacker@example.com", "asst@evil.com")),
+      await webhookReq(payloadWithIds("attacker@example.com", "asst@evil.com")),
       env as never,
     );
     const ev = findEvent("webhook.dynamic_variables");
@@ -733,9 +1217,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
   });
 
   it("replaces non-string values (number, object) with empty string", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(payloadWithIds(12345, { nested: "object" })),
+      await webhookReq(payloadWithIds(12345, { nested: "object" })),
       env as never,
     );
     const ev = findEvent("webhook.dynamic_variables");
@@ -747,9 +1231,9 @@ describe("/webhooks/dynamic-variables — id validation", () => {
   });
 
   it("replaces null ids with empty string", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(payloadWithIds(null, null)),
+      await webhookReq(payloadWithIds(null, null)),
       env as never,
     );
     const ev = findEvent("webhook.dynamic_variables");
@@ -760,11 +1244,11 @@ describe("/webhooks/dynamic-variables — id validation", () => {
   it("invalid sentinel values appear nowhere in captured logs or response", async () => {
     const sentinels = {
       callControlId: "cc-attacker@evil.com with spaces\nline2",
-      assistantId: "asst\u0000null-byte\u0007bell",
+      assistantId: "asst\0null-byte\u0007bell",
     };
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     const res = await handler.fetch(
-      webhookReq(payloadWithIds(sentinels.callControlId, sentinels.assistantId)),
+      await webhookReq(payloadWithIds(sentinels.callControlId, sentinels.assistantId)),
       env as never,
     );
     expect(res.status).toBe(200);
@@ -784,14 +1268,14 @@ describe("/webhooks/dynamic-variables — id validation", () => {
     expect(allLogs).not.toContain("line2");
     expect(allLogs).not.toContain("null-byte");
     expect(allLogs).not.toContain("bell");
-    expect(allLogs).not.toContain("\u0000");
-    expect(allLogs).not.toContain("\u0007");
+    expect(allLogs).not.toContain("\0");
+    expect(allLogs).not.toContain("\x07");
   });
 
   it("valid request still produces exactly one webhook.dynamic_variables event", async () => {
-    const env = { CONFIG: validKv(VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
     await handler.fetch(
-      webhookReq(initPayload("+15550000030")),
+      await webhookReq(initPayload("+15550000030")),
       env as never,
     );
     const events = logEvents().filter(

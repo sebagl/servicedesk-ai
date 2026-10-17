@@ -1,12 +1,14 @@
-import type { KvNamespace } from "@telnyx/edge-runtime";
+import type { KvNamespace, Secrets } from "@telnyx/edge-runtime";
 
 import { loadConfig, type ConfigResult } from "./config";
 import { readBoundedBody } from "./bookings";
 import { getLocalDateString, getLocalTimeParts } from "./scheduling";
 import { logEvent, maskPhone } from "./logger";
+import { verifyWebhookSignature } from "./webhook-signature";
 
 interface Env {
   CONFIG?: KvNamespace;
+  SECRETS?: Secrets;
 }
 
 const WEEKDAY_NAMES = [
@@ -58,6 +60,12 @@ function formatBusinessHours(
 // slow KV must not stall the 200 the caller expects at assistant init.
 const CONFIG_WAIT_MS = 800;
 
+// Tight cap on the secrets read used to fetch the Ed25519 public key. The
+// secret store is normally warm, but a hung lookup must not stall the
+// assistant-init path — verifyWebhookSignature needs the key, and the
+// webhook cannot answer the call without it.
+const WEBHOOK_KEY_WAIT_MS = 200;
+
 // Race loadConfig against a fixed deadline so the webhook cannot hang on a
 // slow KV. A late resolution is discarded; a late rejection is caught so it
 // cannot escape as an unhandled promise rejection.
@@ -76,13 +84,37 @@ async function loadConfigBounded(
   return outcome;
 }
 
+// Race the secrets read for the Ed25519 verification key against a fixed
+// deadline. Mirrors loadConfigBounded: a late resolution is discarded, a
+// late rejection is converted to ok:false so it cannot escape as an
+// unhandled rejection. The setTimeout handle is always cleared once the race
+// settles, so the timer does not outlive the request.
+async function loadWebhookKeyBounded(
+  secrets: Secrets,
+): Promise<{ ok: true; key: string } | { ok: false }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const keyPromise = secrets.get("WEBHOOK_PUBLIC_KEY").then(
+    (key): { ok: true; key: string } | { ok: false } =>
+      typeof key === "string" && key.length > 0
+        ? { ok: true, key }
+        : { ok: false },
+    (): { ok: false } => ({ ok: false }),
+  );
+  const timeoutPromise = new Promise<{ ok: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false }), WEBHOOK_KEY_WAIT_MS);
+  });
+  const outcome = await Promise.race([keyPromise, timeoutPromise]);
+  if (timer !== undefined) clearTimeout(timer);
+  return outcome;
+}
+
 // Telnyx calls this endpoint at assistant initialization to fetch runtime
 // variables it can interpolate into the conversation. We must answer 200
 // quickly regardless of internal state so the call continues; a degraded
 // system_status signals the assistant to be cautious about taking bookings.
-// NOTE: Telnyx request signature verification is a planned follow-up; the
-// endpoint is currently unauthenticated because it returns only non-sensitive
-// business info.
+// Each delivery is verified against the Ed25519 public key stored in
+// SECRETS.WEBHOOK_PUBLIC_KEY; a missing / slow / failed secret lookup fails
+// closed (503) so an unauthenticated caller cannot reach the handler.
 
 export async function handleDynamicVariables(
   req: Request,
@@ -120,6 +152,54 @@ export async function handleDynamicVariables(
       latency_ms: Date.now() - start,
     });
     return Response.json({ error: "bad_request" }, { status: 400 });
+  }
+
+  // Verify the delivery before parsing or touching KV. The key read is
+  // bounded (200ms) so a slow secrets backend cannot stall the assistant
+  // init path; any failure — missing binding, empty value, late or rejected
+  // promise — collapses to a generic 503, with no leaked detail.
+  if (env.SECRETS === undefined) {
+    logEvent("webhook.rejected", {
+      reason: "key_unavailable",
+      http_status: 503,
+      latency_ms: Date.now() - start,
+    });
+    return Response.json({ error: "service_unavailable" }, { status: 503 });
+  }
+  const keyResult = await loadWebhookKeyBounded(env.SECRETS);
+  if (!keyResult.ok) {
+    logEvent("webhook.rejected", {
+      reason: "key_unavailable",
+      http_status: 503,
+      latency_ms: Date.now() - start,
+    });
+    return Response.json({ error: "service_unavailable" }, { status: 503 });
+  }
+
+  const verifyOutcome = await verifyWebhookSignature({
+    rawBody: bodyResult.raw,
+    headers: req.headers,
+    publicKeyBase64: keyResult.key,
+    nowMs: Date.now(),
+  });
+  if (verifyOutcome.kind === "invalid_configuration") {
+    // A malformed key is a deployment problem; surface the same generic 503
+    // a slow secrets lookup would, so an operator can fix the binding
+    // without distinguishing the two cases by status code.
+    logEvent("webhook.rejected", {
+      reason: "key_unavailable",
+      http_status: 503,
+      latency_ms: Date.now() - start,
+    });
+    return Response.json({ error: "service_unavailable" }, { status: 503 });
+  }
+  if (verifyOutcome.kind === "invalid_signature") {
+    logEvent("webhook.rejected", {
+      reason: "invalid_signature",
+      http_status: 401,
+      latency_ms: Date.now() - start,
+    });
+    return Response.json({ error: "unauthorized" }, { status: 401 });
   }
 
   let body: unknown;
