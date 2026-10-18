@@ -231,7 +231,41 @@ function validateState(raw: unknown): DayAgendaState {
 // One instance per location/local-calendar-date, e.g. main-2026-10-19.
 // ---------------------------------------------------------------------------
 
+export interface BookingListItem {
+  time: string;
+  service_id: string;
+  customer_name: string;
+  customer_phone: string;
+  created_at: string;
+}
+
 export class DayAgenda extends StatefulActor {
+  // Operator view of the day: includes customer name and phone by design.
+  // Callers must keep this behind an authenticated route and never log it.
+  async listBookings(): Promise<{ bookings: BookingListItem[] }> {
+    let raw: unknown;
+    try {
+      raw = await this.ctx.storage.get<unknown>(STORAGE_KEY);
+    } catch {
+      throw new Error("agenda storage read failed");
+    }
+    if (raw === undefined) return { bookings: [] };
+    const state = validateState(raw);
+    const bookings = Object.keys(state.bookings)
+      .sort()
+      .map((time) => {
+        const b = state.bookings[time]!;
+        return {
+          time: b.time,
+          service_id: b.service_id,
+          customer_name: b.customer_name,
+          customer_phone: b.customer_phone,
+          created_at: b.created_at,
+        };
+      });
+    return { bookings };
+  }
+
   async getOccupiedSlots(): Promise<{ occupied: string[] }> {
     let raw: unknown;
     try {

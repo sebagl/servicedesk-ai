@@ -88,6 +88,30 @@ key, or an `invalid_configuration` from `crypto.subtle` fails closed with
 `401 { error: "unauthorized" }`. See `src/webhook-signature.ts` and
 `src/dynamic-variables.ts`.
 
+## Operator portal
+
+`GET /portal` serves a single static page (React 18 from a pinned CDN, no
+build step) that holds no data. On load it asks once for the portal token
+(the `PORTAL_API_TOKEN` secret, bound as `PORTAL_AUTH`), keeps it in
+`sessionStorage`, and refreshes every 10 s from `GET /api/appointments`,
+`/api/kpis` and `/api/observability`. Those routes require
+`Authorization: Bearer <token>` (missing secret `503`, bad token `401`, wrong
+method `405`). Tabs:
+
+- **Appointments** — bookings for today and the next 6 days (time, service,
+  name, phone) and the callback request queue.
+- **Business KPIs** — follow-up opportunities for the last 7 days: callers
+  who checked availability but did not book, booking requests we could not
+  serve, pending callbacks, and upcoming customers to remind about their next
+  service, plus bookings confirmed. Every figure comes from stored data.
+- **Observability** — system status, today's webhook counts and average
+  latency, per-tool calls/errors/latency, and the 50 most recent events.
+
+Metrics come from a `Metrics` Actor per local day (`metrics-YYYY-MM-DD`)
+holding counters, latencies and conversation ids only, never customer data.
+Recording is best-effort with a 300 ms bound, so it never changes a webhook
+or tool result.
+
 ## Local commands
 
 ```bash

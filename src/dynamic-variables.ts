@@ -5,10 +5,12 @@ import { readBoundedBody } from "./bookings";
 import { getLocalDateString, getLocalTimeParts } from "./scheduling";
 import { logEvent, maskPhone } from "./logger";
 import { verifyWebhookSignature } from "./webhook-signature";
+import { recordMetric, type MetricsNamespace } from "./metrics";
 
 interface Env {
   CONFIG?: KvNamespace;
   SECRETS?: Secrets;
+  METRICS?: MetricsNamespace;
 }
 
 const WEEKDAY_NAMES = [
@@ -229,6 +231,12 @@ export async function handleDynamicVariables(
   env: Env,
 ): Promise<Response> {
   const start = Date.now();
+  const recordRejected = () =>
+    recordMetric(env.METRICS, {
+      event: "webhook",
+      outcome: "rejected",
+      latency_ms: Date.now() - start,
+    });
 
   if (req.method !== "POST") {
     logEvent("webhook.rejected", {
@@ -236,6 +244,7 @@ export async function handleDynamicVariables(
       http_status: 405,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return new Response("method not allowed", {
       status: 405,
       headers: { allow: "POST" },
@@ -252,6 +261,7 @@ export async function handleDynamicVariables(
         http_status: 413,
         latency_ms: Date.now() - start,
       });
+      await recordRejected();
       return Response.json({ error: "payload_too_large" }, { status: 413 });
     }
     logEvent("webhook.rejected", {
@@ -259,6 +269,7 @@ export async function handleDynamicVariables(
       http_status: 400,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return Response.json({ error: "bad_request" }, { status: 400 });
   }
 
@@ -274,6 +285,7 @@ export async function handleDynamicVariables(
       http_status: 503,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return Response.json({ error: "service_unavailable" }, { status: 503 });
   }
   const keyResult = await loadWebhookKeyBounded(env.SECRETS);
@@ -283,6 +295,7 @@ export async function handleDynamicVariables(
       http_status: 503,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return Response.json({ error: "service_unavailable" }, { status: 503 });
   }
 
@@ -301,6 +314,7 @@ export async function handleDynamicVariables(
       http_status: 503,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return Response.json({ error: "service_unavailable" }, { status: 503 });
   }
   if (verifyOutcome.kind === "invalid_signature") {
@@ -309,6 +323,7 @@ export async function handleDynamicVariables(
       http_status: 401,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
 
@@ -321,6 +336,7 @@ export async function handleDynamicVariables(
       http_status: 400,
       latency_ms: Date.now() - start,
     });
+    await recordRejected();
     return Response.json({ error: "invalid_json" }, { status: 400 });
   }
 
@@ -402,6 +418,11 @@ export async function handleDynamicVariables(
     system_status: systemStatus,
     booking_enabled: bookingEnabled ? "true" : "false",
     config_outcome: configOutcome,
+    latency_ms: Date.now() - start,
+  });
+  await recordMetric(env.METRICS, {
+    event: "webhook",
+    outcome: systemStatus,
     latency_ms: Date.now() - start,
   });
 

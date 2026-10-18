@@ -19,6 +19,7 @@ import type { ConversationBooking as ConversationBookingActor } from "./conversa
 import type { ConversationBookingResult } from "./conversation-booking";
 import type { CallbackQueueNamespace } from "./callback-binding";
 import { logEvent, maskPhone } from "./logger";
+import { recordMetric, type MetricsNamespace } from "./metrics";
 
 const SERVICE_INFO = { name: "servicedesk-ai", version: "0.0.0" } as const;
 
@@ -76,7 +77,7 @@ function readConversationId(extra: CallbackExtra): string | undefined {
 function registerGetServiceCatalog(
   server: McpServer,
   kv: KvNamespace | undefined,
-  callId: string,
+  ctx: ToolContext,
 ): void {
   server.registerTool(
     "get_service_catalog",
@@ -91,7 +92,7 @@ function registerGetServiceCatalog(
       if (kv === undefined) {
         return logToolResult(
           "get_service_catalog",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -101,7 +102,7 @@ function registerGetServiceCatalog(
       if (!result.ok) {
         return logToolResult(
           "get_service_catalog",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -109,7 +110,7 @@ function registerGetServiceCatalog(
       }
       return logToolResult(
         "get_service_catalog",
-        callId,
+        ctx,
         start,
         {
           content: [
@@ -170,23 +171,36 @@ function classifyToolOutcome(result: unknown): string {
   }
 }
 
-function logToolResult<T>(
+interface ToolContext {
+  callId: string;
+  metrics?: MetricsNamespace;
+}
+
+async function logToolResult<T>(
   tool: string,
-  callId: string,
+  ctx: ToolContext,
   start: number,
   result: T,
   conversationId?: string,
-): T {
+): Promise<T> {
+  const outcome = classifyToolOutcome(result);
+  const latencyMs = Date.now() - start;
   const fields: Record<string, string | number | boolean> = {
     tool,
-    call_control_id: callId,
-    outcome: classifyToolOutcome(result),
-    latency_ms: Date.now() - start,
+    call_control_id: ctx.callId,
+    outcome,
+    latency_ms: latencyMs,
   };
   if (conversationId !== undefined) {
     fields.telnyx_conversation_id = conversationId;
   }
   logEvent("mcp.tool_call", fields);
+  await recordMetric(ctx.metrics, {
+    event: `mcp.${tool}`,
+    outcome,
+    latency_ms: latencyMs,
+    ...(conversationId !== undefined ? { telnyx_conversation_id: conversationId } : {}),
+  });
   return result;
 }
 
@@ -199,7 +213,7 @@ function registerGetAvailability(
   server: McpServer,
   config: KvNamespace | undefined,
   agenda: AgendaNamespace | undefined,
-  callId: string,
+  ctx: ToolContext,
 ): void {
   server.registerTool(
     "get_availability",
@@ -214,7 +228,7 @@ function registerGetAvailability(
       if (!isValidDate(args.date)) {
         return logToolResult(
           "get_availability",
-          callId,
+          ctx,
           start,
           toolError("date_invalid"),
           conversationId,
@@ -223,7 +237,7 @@ function registerGetAvailability(
       if (config === undefined || agenda === undefined) {
         return logToolResult(
           "get_availability",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -233,7 +247,7 @@ function registerGetAvailability(
       if (!cfgResult.ok) {
         return logToolResult(
           "get_availability",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -252,7 +266,7 @@ function registerGetAvailability(
         ) {
           return logToolResult(
             "get_availability",
-            callId,
+            ctx,
             start,
             toolError(result.kind),
             conversationId,
@@ -260,7 +274,7 @@ function registerGetAvailability(
         }
         return logToolResult(
           "get_availability",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -268,7 +282,7 @@ function registerGetAvailability(
       }
       return logToolResult(
         "get_availability",
-        callId,
+        ctx,
         start,
         {
           content: [
@@ -364,7 +378,7 @@ function conversationActorName(conversationId: string): string {
 function registerCreateBooking(
   server: McpServer,
   conversationBooking: ConversationBookingNamespace | undefined,
-  callId: string,
+  ctx: ToolContext,
 ): void {
   server.registerTool(
     "create_booking",
@@ -390,7 +404,7 @@ function registerCreateBooking(
       if (conversationId === undefined) {
         return logToolResult(
           "create_booking",
-          callId,
+          ctx,
           start,
           toolError("conversation_id_required"),
           conversationId,
@@ -405,7 +419,7 @@ function registerCreateBooking(
       if (conversationBooking === undefined) {
         return logToolResult(
           "create_booking",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -432,7 +446,7 @@ function registerCreateBooking(
       } catch {
         return logToolResult(
           "create_booking",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -447,7 +461,7 @@ function registerCreateBooking(
       if (validated !== null) {
         return logToolResult(
           "create_booking",
-          callId,
+          ctx,
           start,
           {
             content: [
@@ -480,7 +494,7 @@ function registerCreateBooking(
       ) {
         return logToolResult(
           "create_booking",
-          callId,
+          ctx,
           start,
           toolError((raw as { code: string }).code),
           conversationId,
@@ -489,7 +503,7 @@ function registerCreateBooking(
 
       return logToolResult(
         "create_booking",
-        callId,
+        ctx,
         start,
         toolError(),
         conversationId,
@@ -516,7 +530,7 @@ const CALLBACK_QUEUE_ACTOR_NAME = "main";
 function registerRequestCallback(
   server: McpServer,
   callbackQueue: CallbackQueueNamespace | undefined,
-  callId: string,
+  ctx: ToolContext,
 ): void {
   server.registerTool(
     "request_callback",
@@ -535,7 +549,7 @@ function registerRequestCallback(
       if (conversationId === undefined) {
         return logToolResult(
           "request_callback",
-          callId,
+          ctx,
           start,
           toolError("conversation_id_required"),
           conversationId,
@@ -545,7 +559,7 @@ function registerRequestCallback(
       if (callbackQueue === undefined) {
         return logToolResult(
           "request_callback",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -564,7 +578,7 @@ function registerRequestCallback(
       } catch {
         return logToolResult(
           "request_callback",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -578,7 +592,7 @@ function registerRequestCallback(
       ) {
         return logToolResult(
           "request_callback",
-          callId,
+          ctx,
           start,
           toolError(),
           conversationId,
@@ -594,10 +608,15 @@ function registerRequestCallback(
         phone_masked: maskPhone(args.customer_phone),
         latency_ms: latencyMs,
       });
+      await recordMetric(ctx.metrics, {
+        event: "callback",
+        outcome: "requested",
+        telnyx_conversation_id: conversationId,
+      });
 
       return logToolResult(
         "request_callback",
-        callId,
+        ctx,
         start,
         {
           content: [
@@ -622,6 +641,7 @@ export interface McpDeps {
   // forwarded as a header), logged so a call can be traced across webhook
   // and tool calls. Never used for authorization or business logic.
   callId?: string;
+  metrics?: MetricsNamespace;
 }
 
 // One server + one transport per request. No shared session state across
@@ -637,10 +657,11 @@ export async function handleMcpRequest(
     enableJsonResponse: true,
   });
 
-  registerGetServiceCatalog(server, deps.config, deps.callId ?? "");
-  registerGetAvailability(server, deps.config, deps.agenda, deps.callId ?? "");
-  registerCreateBooking(server, deps.conversationBooking, deps.callId ?? "");
-  registerRequestCallback(server, deps.callbackQueue, deps.callId ?? "");
+  const ctx: ToolContext = { callId: deps.callId ?? "", metrics: deps.metrics };
+  registerGetServiceCatalog(server, deps.config, ctx);
+  registerGetAvailability(server, deps.config, deps.agenda, ctx);
+  registerCreateBooking(server, deps.conversationBooking, ctx);
+  registerRequestCallback(server, deps.callbackQueue, ctx);
 
   try {
     await server.connect(transport);

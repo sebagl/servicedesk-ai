@@ -2,10 +2,12 @@ export { Counter } from "./counter";
 export { DayAgenda } from "./agenda-actor";
 export { ConversationBooking } from "./conversation-actor";
 export { CallbackQueue } from "./callback-queue-actor";
+export { Metrics } from "./metrics-actor";
 import type { Counter } from "./counter";
 import type { AgendaNamespace } from "./agenda-binding";
 import type { ConversationBooking as ConversationBookingActor } from "./conversation-actor";
 import type { CallbackQueueNamespace } from "./callback-binding";
+import type { MetricsNamespace } from "./metrics";
 
 import {
   type ActorNamespace,
@@ -21,6 +23,8 @@ import { handleBookingRequest } from "./bookings";
 import { handleMcpRequest } from "./mcp-server";
 import { handleDynamicVariables } from "./dynamic-variables";
 import { logEvent } from "./logger";
+import { handleAppointments, handleKpis, handleObservability, type PortalDeps } from "./portal";
+import { PORTAL_HTML } from "./portal-page";
 
 type CounterStub = ActorStub & Pick<Counter, "increment" | "read">;
 interface CounterNamespace extends ActorNamespace {
@@ -37,6 +41,7 @@ interface Env {
   AGENDA: AgendaNamespace;
   CONVERSATION_BOOKING: ConversationBookingNamespace;
   CALLBACK_QUEUE: CallbackQueueNamespace;
+  METRICS?: MetricsNamespace;
   SECRETS?: Secrets;
   CONFIG?: KvNamespace;
 }
@@ -65,6 +70,22 @@ async function getSmokeToken(env: Env): Promise<string | null> {
     return null;
   }
 }
+
+async function getPortalToken(env: Env): Promise<string | null> {
+  if (!env.SECRETS) return null;
+  try {
+    const token = await env.SECRETS.get("PORTAL_AUTH");
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
+const PORTAL_ROUTES: Record<string, (deps: PortalDeps) => Promise<Response>> = {
+  "/api/appointments": handleAppointments,
+  "/api/kpis": handleKpis,
+  "/api/observability": handleObservability,
+};
 
 // Module-level cache for a successfully read MCP_AUTH token. The secret
 // is bound at deploy time and never rotates within an instance, so the
@@ -152,6 +173,45 @@ export default {
         conversationBooking: env.CONVERSATION_BOOKING,
         callbackQueue: env.CALLBACK_QUEUE,
         callId: readCallId(req),
+        metrics: env.METRICS,
+      });
+    }
+
+    // --- GET /portal — static operator page; holds no data, so no auth ---
+    if (url.pathname === "/portal") {
+      if (req.method !== "GET") {
+        return Response.json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      return new Response(PORTAL_HTML, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    // --- /api/* — operator portal data, PORTAL_AUTH bearer-gated ---
+    const portalRoute = Object.hasOwn(PORTAL_ROUTES, url.pathname)
+      ? PORTAL_ROUTES[url.pathname]
+      : undefined;
+    if (portalRoute !== undefined) {
+      // Authenticate before reading KV or reaching any Actor.
+      const portalToken = await getPortalToken(env);
+      if (portalToken === null) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+      const portalCredential = extractBearer(req);
+      if (portalCredential === null || !constantTimeEqual(portalCredential, portalToken)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      if (req.method !== "GET") {
+        return Response.json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      return portalRoute({
+        config: env.CONFIG,
+        agenda: env.AGENDA,
+        callbackQueue: env.CALLBACK_QUEUE,
+        metrics: env.METRICS,
       });
     }
 

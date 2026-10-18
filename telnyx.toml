@@ -32,6 +32,13 @@ type    = "ConversationBooking"
 binding = "CALLBACK_QUEUE"
 type    = "CallbackQueue"
 
+# Metrics — one instance per local day (e.g. metrics-2026-10-20) holding
+# counters, latency sums, bounded conversation-id sets and the newest 50
+# events for the operator portal. Never holds customer name or phone.
+[[actors]]
+binding = "METRICS"
+type    = "Metrics"
+
 # KV namespace for service catalog + business configuration.
 # Created via `telnyx-edge storage kv create --name servicedesk-ai-config`.
 # Not available in local `dev` — config loader fails closed (503) without it.
@@ -62,6 +69,14 @@ name    = "MCP_API_TOKEN"
 [[secrets]]
 binding = "WEBHOOK_PUBLIC_KEY"
 name    = "TELNYX_PUBLIC_KEY"
+
+# Operator portal bearer token for /api/*. Distinct from SMOKE_AUTH and
+# MCP_AUTH so the portal can be revoked on its own:
+#   `telnyx-edge secrets add PORTAL_API_TOKEN <value>`.
+# Local `dev` does not emulate secrets — /api/* fails closed (503) without it.
+[[secrets]]
+binding = "PORTAL_AUTH"
+name    = "PORTAL_API_TOKEN"
 
 # Registered via `telnyx-edge new-func --actor` (2026-10-16).
 # Required for `ship`; `dev` and `types` do not need it.
