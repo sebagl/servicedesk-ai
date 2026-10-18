@@ -63,11 +63,30 @@ async function getSmokeToken(env: Env): Promise<string | null> {
   }
 }
 
+// Module-level cache for a successfully read MCP_AUTH token. The secret
+// is bound at deploy time and never rotates within an instance, so the
+// first read is the only read we need to pay for on the /mcp hot path.
+// Failures (empty value, rejected promise, missing binding) are not cached:
+// the next request must be allowed to retry the lookup.
+let cachedMcpToken: string | null = null;
+
+// Test-only escape hatch so suites that drive the handler directly can
+// observe the first-lookup semantics in isolation. Production code never
+// calls this — the cache is invalidated by an instance restart.
+export function __resetMcpTokenCacheForTests(): void {
+  cachedMcpToken = null;
+}
+
 async function getMcpToken(env: Env): Promise<string | null> {
   if (!env.SECRETS) return null;
+  if (cachedMcpToken !== null) return cachedMcpToken;
   try {
     const token = await env.SECRETS.get("MCP_AUTH");
-    return token || null;
+    if (typeof token === "string" && token.length > 0) {
+      cachedMcpToken = token;
+      return token;
+    }
+    return null;
   } catch {
     return null;
   }

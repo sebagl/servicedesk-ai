@@ -7,6 +7,7 @@ vi.mock("@telnyx/edge-runtime", () => ({
 }));
 
 import handler from "../src/index";
+import { __resetMcpTokenCacheForTests } from "../src/index";
 import type { AppConfig } from "../src/config";
 import type {
   ConversationBookingInput,
@@ -87,6 +88,14 @@ function validSecrets(): SecretsMock {
 function fullEnv(secrets?: SecretsMock, kv?: KvMock): unknown {
   return { SECRETS: secrets, CONFIG: kv };
 }
+
+// Reset the module-level MCP_AUTH cache so each test exercises the
+// first-lookup semantics in isolation. Production code never calls the
+// reset — the cache is invalidated by an instance restart, which is the
+// right time to re-read a binding that may have rotated.
+beforeEach(() => {
+  __resetMcpTokenCacheForTests();
+});
 
 // ---------------------------------------------------------------------------
 // Auth gate — runs before protocol processing and KV access
@@ -1781,5 +1790,97 @@ describe("/mcp — telnyx_conversation_id correlation (params._meta)", () => {
     const [ev] = toolCalls("get_service_catalog");
     expect(ev?.call_control_id).toBe("call-999");
     expect(ev?.telnyx_conversation_id).toBe("conv-XYZ");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP_AUTH cache — the /mcp hot path authenticates every request against
+// the bearer token, and reading the token from SECRETS on every request
+// is wasted work: the binding is immutable for the lifetime of the
+// instance. We cache a successful read module-level and short-circuit
+// subsequent requests. Failures (empty value, rejected promise, missing
+// binding) are never cached so the next request can retry the lookup.
+// ---------------------------------------------------------------------------
+
+describe("/mcp — MCP_AUTH cache", () => {
+  it("second request serves from cache; SECRETS.get is not called again", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const secrets = validSecrets();
+    const env = fullEnv(secrets, kv);
+
+    const res1 = await handler.fetch(
+      mcpRequest(jsonRpcBody(1, "initialize"), mcpHeaders(VALID_TOKEN)),
+      env as never,
+    );
+    expect(res1.status).toBe(200);
+    expect(secrets.get).toHaveBeenCalledTimes(1);
+
+    const res2 = await handler.fetch(
+      mcpRequest(jsonRpcBody(2, "initialize"), mcpHeaders(VALID_TOKEN)),
+      env as never,
+    );
+    expect(res2.status).toBe(200);
+    // The warm path short-circuits the lookup, so SECRETS.get is not
+    // called a second time on the same env.
+    expect(secrets.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("empty MCP_AUTH is not cached; a subsequent valid lookup retries SECRETS.get", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const emptySecrets: SecretsMock = {
+      get: vi.fn(async (binding: string) => {
+        if (binding === "MCP_AUTH") return "";
+        if (binding === "SMOKE_AUTH") return "smoke";
+        throw new Error("unknown binding");
+      }),
+    };
+    const env1 = fullEnv(emptySecrets, kv);
+
+    const res1 = await handler.fetch(
+      mcpRequest(jsonRpcBody(1, "initialize"), mcpHeaders(VALID_TOKEN)),
+      env1 as never,
+    );
+    expect(res1.status).toBe(503);
+    expect(emptySecrets.get).toHaveBeenCalledTimes(1);
+
+    // Second request on a different env whose secrets return the valid
+    // token. Because the empty read did not populate the cache, the
+    // handler must call SECRETS.get on the new env and succeed.
+    const validSecrets2 = validSecrets();
+    const env2 = fullEnv(validSecrets2, kv);
+    const res2 = await handler.fetch(
+      mcpRequest(jsonRpcBody(1, "initialize"), mcpHeaders(VALID_TOKEN)),
+      env2 as never,
+    );
+    expect(res2.status).toBe(200);
+    expect(validSecrets2.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("MCP_AUTH rejection is not cached; a subsequent valid lookup retries SECRETS.get", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const rejectingSecrets2: SecretsMock = {
+      get: vi.fn(async (binding: string) => {
+        if (binding === "MCP_AUTH") throw new Error("retrieval failed");
+        if (binding === "SMOKE_AUTH") return "smoke";
+        throw new Error("unknown binding");
+      }),
+    };
+    const env1 = fullEnv(rejectingSecrets2, kv);
+
+    const res1 = await handler.fetch(
+      mcpRequest(jsonRpcBody(1, "initialize"), mcpHeaders(VALID_TOKEN)),
+      env1 as never,
+    );
+    expect(res1.status).toBe(503);
+    expect(rejectingSecrets2.get).toHaveBeenCalledTimes(1);
+
+    const validSecrets2 = validSecrets();
+    const env2 = fullEnv(validSecrets2, kv);
+    const res2 = await handler.fetch(
+      mcpRequest(jsonRpcBody(1, "initialize"), mcpHeaders(VALID_TOKEN)),
+      env2 as never,
+    );
+    expect(res2.status).toBe(200);
+    expect(validSecrets2.get).toHaveBeenCalledTimes(1);
   });
 });

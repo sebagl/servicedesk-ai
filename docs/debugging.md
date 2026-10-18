@@ -750,3 +750,78 @@ log, no leak") that:
 
 The pre-existing "actor throws" case continues to assert the same
 behavior when `stub.book()` (rather than `idFromName`) throws.
+
+
+## Dynamic-variables webhook: secret lookup slower than its timeout (503 on every request)
+
+### Context
+
+`POST /webhooks/dynamic-variables` verifies the Telnyx Ed25519 signature on every
+delivery. Before verifying, it reads the public key from `SECRETS`
+(binding `WEBHOOK_PUBLIC_KEY`) with a bounded wait. Any key-lookup failure fails
+closed with `503`. Telnyx waits 1.5 s by default for this webhook; if it times out,
+the call continues with the assistant's default variables (`booking_enabled=false`).
+
+### Discovery
+
+After deploying signature verification (`f9b33ca`), an unsigned test request
+returned `503` instead of the expected `401`. A missing key was not assumed: on this
+path a `503` can also mean a slow, failed, or malformed key lookup, and the logs
+could not tell them apart because every key failure used the same
+`reason: key_unavailable`.
+
+### Evidence
+
+Production runtime logs (`telnyx-edge logs servicedesk-ai`), after deploying
+distinct rejection reasons and lookup timing:
+
+- 00:10 UTC — several `SIGTERM received, shutting down` lines: old instances
+  stopping after the deploy, so the following requests hit cold instances.
+- 00:19:34 UTC, warm instance:
+  - `webhook.key_lookup_completed` — `outcome=ok`, `elapsed_ms=708`, `after_timeout=false`
+  - `webhook.rejected` — `reason=invalid_signature`, `http_status=401`, `latency_ms=738`
+
+### Root cause
+
+The deployed version (`f9b33ca`) bounded the secret lookup at 200 ms, but the
+lookup takes ~700 ms in production (708 ms measured on a warm instance). Every
+request therefore hit the timeout and returned `503`. All key failures were logged
+with the same `reason: key_unavailable`, so a timeout could not be told apart from
+a missing or malformed key.
+
+Broader issue: even with a larger bound, ~700 ms of secret lookup plus the KV config
+read (bounded at 800 ms) plus a cold start can exceed Telnyx's 1.5 s webhook timeout.
+
+### Risk
+
+- Every webhook delivery failed with `503` while the 200 ms bound was deployed.
+- Calls fall back to the assistant defaults (`booking_enabled=false`), so the
+  assistant would refuse bookings.
+- No data exposure: the endpoint failed closed.
+
+### Fix
+
+1. Diagnostics: distinct rejection reasons (`key_timeout`, `key_empty`,
+   `key_read_failed`, `verification_configuration_invalid`) and a
+   `webhook.key_lookup_completed` event with `elapsed_ms`. This is what exposed
+   the 708 ms lookup.
+2. Bound raised from 200 ms to 1000 ms.
+3. Successful `WEBHOOK_PUBLIC_KEY` and `MCP_AUTH` reads are cached per instance;
+   failures are never cached. The event logs `cached=true|false`. A rotated key is
+   picked up only after an instance restart.
+4. Configuration: the assistant's `dynamic_variables_webhook_timeout_ms` raised to
+   5000 ms.
+
+### Verification
+
+Production logs after the fix, two consecutive unsigned requests:
+
+- First request: `cached=false`, `elapsed_ms=<VALUE>`, `latency_ms=<VALUE>`, `401`
+- Second request: `cached=true`, `latency_ms=<VALUE>`, `401`
+
+### Limits
+
+- The `503` log lines from the 200 ms deploy were outside the queried window; the
+  cause is established from the code (200 ms bound) and the measured 708 ms lookup.
+- Cold-start lookup latency was not measured directly.
+- No load testing.

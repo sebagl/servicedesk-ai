@@ -2171,3 +2171,917 @@ Both scenarios end in the same observable state on the wire
 but reach it through different failure paths. Test 5 fails the
 conversation Actor's `confirmed`-state write; test 6 fails the RPC
 delivery from `DayAgenda` after the Agenda had already persisted.
+
+## 5.x — Ship with Ed25519 webhook signature verification; unauthenticated remote checks
+
+**Date:** 2026-10-17
+**Scope:** Single authorized deployment of the existing `servicedesk-ai`
+function (overriding the no-deploy rule for this task only), followed by
+unauthenticated boundary checks against the live URL. No remote KV
+modifications, no authenticated booking or MCP calls, no secret values
+retrieved, no `.env` read.
+**Not claimed:** real Telnyx webhook signatures verified; cross-Actor
+booking execution verified; authenticated MCP, demo, or booking flows
+verified; `WEBHOOK_PUBLIC_KEY` reachability on the remote runtime.
+
+### Manifest and pre-deploy verification (preserved, not re-registered)
+
+| Binding | Value | Preserved? |
+|---|---|---|
+| `func_id` | `a666861a-13f6-4dd3-8955-8201bee7209c` | Yes |
+| `func_name` | `servicedesk-ai` | Yes |
+| `[[actors]] COUNTER` → `Counter` | declared | Yes |
+| `[[actors]] AGENDA` → `DayAgenda` | declared | Yes |
+| `[[actors]] CONVERSATION_BOOKING` → `ConversationBooking` | declared | Yes |
+| `[storage.kv.CONFIG]` | `id = 533e7681-de0d-4af6-bf4d-1da671f7f5d3` | Yes |
+| `[[secrets]] SMOKE_AUTH` → `SMOKE_TEST_TOKEN` | declared | Yes |
+| `[[secrets]] MCP_AUTH` → `MCP_API_TOKEN` | declared | Yes |
+| `[[secrets]] WEBHOOK_PUBLIC_KEY` → `TELNYX_PUBLIC_KEY` | declared | Yes |
+
+`telnyx-env.d.ts` was not edited by hand. `npm run typecheck` → 0 errors.
+`npm test` → **510/510** passing across 14 files (45 smoke, 58 scheduling,
+13 TZ-independence, 64 agenda-actor, 37 availability, 45 bookings, 55 MCP,
+21 conversation-booking, 8 conversation-actor, 30 booking-service,
+49 webhook, 55 webhook-signature, 24 verify-mcp-conversation script,
+6 booking-flow integration).
+
+### Deployment
+
+- Command: `telnyx-edge ship` (single attempt).
+- Result: **deployed successfully** in 9m51s on the first attempt. No
+  retry, no `new-func` re-registration.
+- URL: `https://servicedesk-ai-a666861a-1.telnyxcompute.com`
+  (same host as the recorded 2026-10-16 ships; the deployed function ID is
+  unchanged).
+
+### Unauthenticated remote checks
+
+```
+$ curl -i https://servicedesk-ai-a666861a-1.telnyxcompute.com/health
+HTTP/2 200
+content-type: application/json
+{"status":"ok","service":"servicedesk-ai"}
+
+$ curl -i -X POST https://servicedesk-ai-a666861a-1.telnyxcompute.com/mcp \
+       -H 'Content-Type: application/json' --data '{}'
+HTTP/2 401
+content-type: application/json
+{"error":"unauthorized"}
+
+$ curl -i -X POST \
+       https://servicedesk-ai-a666861a-1.telnyxcompute.com/webhooks/dynamic-variables \
+       -H 'Content-Type: application/json' --data '{}'
+HTTP/2 503
+content-type: application/json
+{"error":"service_unavailable"}
+```
+
+| Check | Expected | Actual | Pass? |
+|---|---|---|---|
+| `GET /health` → 200 with service payload | 200 | `200 {"status":"ok","service":"servicedesk-ai"}` | Yes |
+| `POST /mcp {}` → 401 (auth gate) | 401 | `401 {"error":"unauthorized"}` | Yes |
+| `POST /webhooks/dynamic-variables {}` no signature → 401 (verifier rejects request) | 401 | `503 {"error":"service_unavailable"}` | **No — fail-closed** |
+
+### Interpretation of the 503 on the webhook check
+
+**Observed:** every unsigned POST to `/webhooks/dynamic-variables` returned
+`503 { error: "service_unavailable" }` (1 attempt during the boundary checks
+above; 3 sequential attempts during the 5.x.a diagnostic below).
+
+**What we can conclude from the wire alone:** the handler returned a
+fail-closed `503` from one of three handler-level branches in
+`src/dynamic-variables.ts`. For a request with NO signature headers, the
+verifier's `headers.get("telnyx-signature-ed25519")` /
+`headers.get("telnyx-timestamp")` checks (`src/webhook-signature.ts:108-118`)
+sit *behind* all three 503 branches, so a 503 means the verifier did not
+evaluate the request headers at all. The three 503-producing branches are:
+
+1. **`env.SECRETS === undefined`** (`dynamic-variables.ts:161-168`) —
+   the runtime did not bind `SECRETS`. Ruled out by the 5.x.a diagnostic
+   below: the `TELNYX_PUBLIC_KEY` secret exists in the remote store
+   (`telnyx-edge secrets list`), and the same runtime answers 401 on
+   `/mcp` and `/demo/*`, both of which require `env.SECRETS` to be
+   non-undefined.
+2. **`loadWebhookKeyBounded` returns `{ ok: false }`** (`dynamic-variables.ts:170-177`)
+   — possible sub-causes: (a) `WEBHOOK_KEY_WAIT_MS` (200 ms) timer fired
+   before `secrets.get("WEBHOOK_PUBLIC_KEY")` resolved; (b) the lookup
+   resolved with an empty / non-string value; (c) the lookup rejected.
+3. **`verifyWebhookSignature` returns `invalid_configuration`** (`dynamic-variables.ts:185-195`)
+   — possible sub-causes inside the verifier (`webhook-signature.ts:90-104, 148-153`):
+   (a) non-finite `nowMs` — impossible by construction (handler passes
+   `Date.now()`); (b) non-string / empty `publicKeyBase64` — already
+   filtered by branch 2; (c) `decodeBase64(publicKeyBase64)` returns `null`
+   or `keyBytes.length !== 32` (the secret exists but stores malformed
+   base64 or wrong-length bytes); (d) `crypto.subtle.importKey` throws
+   (Ed25519 unavailable on the runtime or key bytes are not a valid
+   Ed25519 point); (e) `crypto.subtle.verify` throws.
+
+**What we cannot conclude from the wire alone:** which of branches 2 or 3
+fired. The 503 body is the generic `service_unavailable` envelope by
+design — the handler deliberately does not distinguish "missing key",
+"slow lookup", "malformed key", and `crypto.subtle` failure on the wire
+(`dynamic-variables.ts:185-195` comment: "surface the same generic 503 a
+slow secrets lookup would, so an operator can fix the binding without
+distinguishing the two cases by status code"). Logs (`webhook.rejected`
+with `reason: "key_unavailable"` and `http_status: 503`) would
+distinguish them but are not accessible from this environment.
+
+This subtask does **not** add, retrieve, or print any secret value, does
+not read `.env`, does not modify remote KV, does not create bookings, and
+does not re-register the function. Resolving the remaining ambiguity
+(key slow / key malformed / `crypto.subtle` failure) is **not** a matter
+of adding the secret — the secret is already present in the remote
+store. It is a matter of distinguishing the branches above, which
+requires either runtime logs or a Telnyx-signed delivery.
+
+### 5.x.a — Diagnostic follow-up: secret existence check and timing
+
+**Date:** 2026-10-17
+**Scope:** Read-only diagnostic to distinguish the 503 branches enumerated
+in 5.x. `telnyx-edge secrets list` was inspected to confirm whether the
+secret is bound (names and metadata only — the CLI explicitly states
+"Values are never shown for security reasons"); the unsigned POST was
+repeated 3 times with a 5 s timeout to capture timing. No source edits,
+no secret writes, no deployment, no bookings.
+**Not claimed:** secret value validity; `crypto.subtle` availability on
+the runtime; that the verifier has been observed running with a valid
+key; that any specific branch in the 5.x enumeration is the cause.
+
+#### Secret existence check (`telnyx-edge secrets list`, names only)
+
+```
+$ telnyx-edge secrets list
+SECRET ID                              SECRET NAME            CREATED AT            UPDATED AT
+------------                           --------------------   -----------------     -----------------
+1866c7b8-6817-4eb0-9102-fd9f0ea40a14   MCP_API_TOKEN          Oct 17, 2026, 01:57   Oct 17, 2026, 01:57
+f8dab01d-da49-4c43-9b26-c21c10094e1c   SMOKE_TEST_TOKEN       Oct 16, 2026, 15:39   Oct 16, 2026, 15:39
+259c1c7b-9e55-48bc-80c9-7f9bdcbc4502   TELNYX_PUBLIC_KEY      Oct 17, 2026, 21:01   Oct 17, 2026, 21:01
+
+Page 1 of 1 (showing 3 of 3 total secrets)
+```
+
+- **`TELNYX_PUBLIC_KEY` exists** in the remote secrets store (created
+  `Oct 17, 2026, 21:01` — before the ship at `21:14:53`). This rules out
+  branch 1 (`env.SECRETS === undefined`) by construction: `env.SECRETS`
+  is set whenever ANY `[[secrets]]` binding is wired, and the other two
+  secrets (`MCP_API_TOKEN`, `SMOKE_TEST_TOKEN`) also exist and produce
+  the expected 401 outcomes on `/mcp` and `/demo/*`.
+- The CLI explicitly states values are never shown, and we did not pass
+  any flag that would attempt to retrieve them. `.env` was not read.
+- Branch 2c (lookup rejects) is implausible given the metadata shows a
+  successfully-created secret; branch 2b (empty value) is possible but
+  cannot be ruled out from `list` alone (the CLI does not display
+  per-secret emptiness).
+- This check does **not** validate the secret's byte length, base64
+  well-formedness, or Ed25519-point validity. Branch 3c (malformed key
+  bytes), 3d (importKey throws), and 3e (verify throws) remain possible
+  and cannot be distinguished without logs or a signed delivery.
+
+#### Timing check (3 sequential unsigned POSTs, 5 s timeout each)
+
+```
+attempt 1: http=503 elapsed_ms=500
+attempt 2: http=503 elapsed_ms=491
+attempt 3: http=503 elapsed_ms=474
+```
+
+- All 3 attempts returned `503`; no progressive slowdown; no 5 s
+  timeout. Total wall-clock for the three was ~1.5 s.
+- The previous boundary check at `21:14:54` recorded
+  `x-envoy-upstream-service-time: 228` ms for the same 503 response.
+  Function-time is therefore ~200–250 ms; the ~500 ms total wall-clock
+  is consistent with a one-time TLS handshake or cold-start path plus
+  steady-state routing.
+- A 200–250 ms function time is *consistent with* the
+  `WEBHOOK_KEY_WAIT_MS = 200` timer having fired (branch 2a — slow
+  lookup), and *consistent with* the key loading within the 200 ms
+  budget and the verifier returning `invalid_configuration` quickly
+  afterwards (branches 3c / 3d / 3e). The two are indistinguishable
+  from this timing alone.
+- The 5.x boundary check elapsed time was not recorded separately but
+  is within the same band.
+
+#### Branches ruled out vs. remaining
+
+| Branch | Description | Status after 5.x.a |
+|---|---|---|
+| 1 | `env.SECRETS === undefined` | **Ruled out** (secret list shows binding exists; other secrets' 401 outcomes prove `env.SECRETS` reaches the handler). |
+| 2a | 200 ms key-read timer fires | **Plausible** (function time ~200–250 ms consistent with timer firing; indistinguishable from 2b/c + 3c/d/e on timing alone). |
+| 2b | key resolves to empty / non-string | **Plausible** (cannot be ruled out from `secrets list`; no value-side info exposed). |
+| 2c | key lookup rejects | **Implausible** (metadata shows successfully-created secret; no other rejection signals). |
+| 3a | non-finite `nowMs` | **Ruled out** (handler passes `Date.now()`, always finite). |
+| 3b | non-string / empty `publicKeyBase64` | **Ruled out** by construction (would have hit branch 2b first). |
+| 3c | `decodeBase64` returns null / wrong length | **Plausible** (secret exists but byte-length / base64 validity unknown from outside). |
+| 3d | `crypto.subtle.importKey` throws | **Plausible** (Ed25519 support and point validity unverified on the runtime). |
+| 3e | `crypto.subtle.verify` throws | **Plausible** (would only fire after `importKey` succeeds and signature-header check passes; this branch is unreachable for an unsigned request if `importKey` succeeded, so a 3e-only failure requires 3d to also have failed and thrown before reaching verify). |
+
+#### Smallest next diagnostic step
+
+To distinguish 2a (slow key) from 3c/3d/3e (verifier rejects) without
+operator credentials, the smallest safe next step is a single Telnyx-signed
+delivery to the deployed endpoint (manually constructed with a known
+Ed25519 keypair where the public side matches whatever is stored as
+`TELNYX_PUBLIC_KEY`). That move is out of scope for this task — it
+requires either operator access to Mission Control's private key, or an
+operator-provided keypair that the agent can use to sign locally. Until
+that step or equivalent log access is authorized, the 503 root cause is
+constrained to {2a, 2b, 3c, 3d} (with 3e unlikely) but **not identified**.
+
+This diagnostic subtask did not edit any source, write any secret, change
+remote KV, create any booking, install any dependency, or commit anything.
+No `.env` was read and no secret value was retrieved or printed.
+
+### What is verified remotely by this subtask
+
+- The existing func_id (`a666861a-13f6-4dd3-8955-8201bee7209c`) is still
+  serving — health and auth-gated surfaces both answer the same URL as the
+  recorded 2026-10-16 ships.
+- The 2026-10-17 build (signature verifier wired into
+  `handleDynamicVariables`, `ConversationBooking` Actor routing, expanded
+  mocked suite) is reachable on the live runtime.
+- The MCP `MCP_AUTH` binding is live and rejects unauthenticated POSTs
+  before protocol processing.
+- The webhook endpoint is now **failing closed** on the unauthenticated
+  path. This is the safer outcome (no unauthenticated request reaches the
+  JSON parser or KV) but it is not the `401` outcome that a properly
+  configured deployment with a valid `WEBHOOK_PUBLIC_KEY` would return,
+  and it is not equivalent to "signature verified".
+
+### What is NOT verified remotely by this subtask
+
+- A real Telnyx-signed delivery against the running verifier
+  (no signed delivery was sent; the verifier's correct behavior on a
+  genuine Telnyx signature is asserted by the 55 mocked tests in
+  `test/webhook-signature.test.ts` and the 49 mocked webhook tests in
+  `test/webhook.test.ts` — not by a live request).
+- The `WEBHOOK_PUBLIC_KEY` binding on the remote runtime (the unauthenticated
+  POST did not progress past the key lookup, so the deployed verifier has
+  not been observed running with a valid key).
+- Authenticated MCP `get_service_catalog` / `get_availability` /
+  `create_booking` calls.
+- Authenticated `/demo/*` flows (config, availability, bookings, counter).
+- The cross-Actor path `MCP → ConversationBooking → DayAgenda → storage`
+  on the remote runtime (mocked tests in `test/booking-flow.integration.test.ts`
+  cover the wiring, but real dispatch across two Actor types under load is
+  not claimed).
+- Persistence, concurrency, and atomicity guarantees on the remote Actor
+  runtime.
+
+### Closing evidence
+
+- `npm run typecheck` → **0 errors**.
+- `npm test` → **510/510** passing across 14 files.
+- Files changed in this subtask (in-repo, not remote):
+  - `README.md` — webhook section, secret bindings, failure modes,
+    pending list, test baseline.
+  - `docs/architecture.md` — route auth row, failure modes, webhook
+    section (signature verification + 200 ms secrets wait), secret
+    bindings, verification status, pending list, test baseline.
+  - `docs/verification.md` — this evidence record.
+- Behavior changes: **none in source**. No source code under `src/`,
+  `test/`, or `config/` was modified by this subtask; the ship
+  redeployed the bundle that already implements signature verification
+  and conversation-Actor routing.
+
+## 5.x.b — Diagnostic labels for dynamic-variable webhook authentication
+
+**Date:** 2026-10-17
+**Scope:** Distinguish the four safe, fixed reasons that can produce a 503 on
+the `/webhooks/dynamic-variables` key/secret path, plus the 503 produced by a
+malformed Ed25519 key inside the verifier. Keep every HTTP response identical
+(503 with `{ "error": "service_unavailable" }`, never the underlying detail),
+keep the 200ms key-read timeout, and never leak keys, headers, request bodies,
+or raw error messages into the log.
+**Not claimed:** remote-runtime evidence — this subtask is local-only. No
+deployment, no remote requests, no `.env` access, no secret retrieval, no
+commit.
+
+### Why this change
+
+The previous handler collapsed every infrastructure failure on the
+key/secret path to a single `webhook.rejected` reason `key_unavailable`. That
+made the 5.x branch enumeration (1, 2a–c, 3c–e) indistinguishable from
+runtime logs alone. The new labels preserve the same operator-visible wire
+behavior but give a structured log line that lets an operator tell
+"secrets binding missing", "key lookup timed out at 200ms", "key resolved to
+an empty / non-string value", "key lookup rejected (promise or synchronous
+throw)", and "the verifier rejected the key as malformed configuration"
+apart.
+
+### Label mapping (`webhook.rejected.reason`)
+
+| Wire outcome | New reason |
+|---|---|
+| `env.SECRETS === undefined` | `secrets_binding_missing` |
+| 200ms timer fires before the read settles | `key_timeout` |
+| Resolved value is not a non-empty string | `key_empty` |
+| Promise rejection from `secrets.get` | `key_read_failed` |
+| Synchronous throw from `secrets.get` | `key_read_failed` |
+| Verifier returns `invalid_configuration` | `verification_configuration_invalid` |
+| Verifier returns `invalid_signature` | `invalid_signature` (unchanged) |
+
+### Implementation (`src/dynamic-variables.ts`)
+
+- `loadWebhookKeyBounded` returns a discriminated union
+  `{ ok: true; key } | { ok: false; reason: "key_timeout" | "key_empty" | "key_read_failed" }`.
+- The 200ms deadline (`WEBHOOK_KEY_WAIT_MS`) is unchanged.
+- Timer is cleared once the race settles, so it cannot outlive the request.
+- A synchronous throw from `secrets.get` (e.g. an unwired binding that throws
+  before returning a promise) is caught by the surrounding `try` and reported
+  as `key_read_failed`.
+- The `.then(_, onRejected)` pair on the read promise consumes the rejection
+  in the normal (async) case, so a late rejection cannot escape as an
+  unhandled promise rejection even if the timer wins the race.
+- `keyPromise` itself never rejects (both handlers are provided), so no
+  `.catch()` fallback is needed on the race.
+- The handler maps each label to the same generic `503 { "error":
+  "service_unavailable" }` body — no detail about the key, the secret store,
+  the request, or the underlying error reaches the wire.
+- Logs carry the structured reason only; never the key value, the public-key
+  base64, the request body, headers, or the raw error message.
+
+### Mocked test coverage (`test/webhook.test.ts`)
+
+A new describe block — `diagnostic labels for key/secret failures` —
+exercises each reason end-to-end through the HTTP handler with mocked
+secrets. The existing "secret key binding" describe block was updated to
+assert the new labels so the previous coverage is not lost.
+
+| Scenario | Reason asserted | Pass |
+|---|---|---|
+| `env.SECRETS === undefined` | `secrets_binding_missing` | ✓ |
+| Key read rejects with a promise | `key_read_failed` | ✓ |
+| Key read throws synchronously | `key_read_failed` | ✓ |
+| Key resolves to an empty string | `key_empty` | ✓ |
+| Key resolves to a non-string value | `key_empty` | ✓ |
+| Key read never settles → 200ms timer | `key_timeout` | ✓ |
+| Stored key is not a valid Ed25519 public key | `verification_configuration_invalid` | ✓ |
+| All labels appear as fixed tokens; no phone, error message, or key bytes leak into the log | (composite) | ✓ |
+
+The synchronous-throw case is covered by a dedicated mock
+(`syncThrowingSecrets`) whose `get` throws before returning a promise. The
+surrounding `try` in `loadWebhookKeyBounded` converts that to
+`{ ok: false, reason: "key_read_failed" }` without allowing the throw to
+propagate as an unhandled rejection.
+
+The "no leak" assertion scans the full structured log set for the four
+phone sentinels used in the loop, the underlying error messages
+(`"secret store down"`, `"sync boom"`), generic substrings (`"Error"`,
+`"stack"`), and the valid public-key base64 from the test's keypair. None
+of these appear in any captured log line.
+
+### Check results
+
+- `npm run typecheck` (`tsc --noEmit`) → **0 errors**
+- `npm run test` (`vitest run`) → **518/518 passed** across 14 files
+  (510 prior + 8 new diagnostic-label tests)
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `src/dynamic-variables.ts` | `loadWebhookKeyBounded` now distinguishes `key_timeout` / `key_empty` / `key_read_failed` and catches synchronous throws; handler uses `secrets_binding_missing`, the propagated `keyResult.reason`, and `verification_configuration_invalid` |
+| `test/webhook.test.ts` | Updated 4 existing assertions to the new labels; added a new describe block with 8 focused tests including the synchronous-throw case |
+| `docs/verification.md` | This evidence record |
+
+Not changed: `src/index.ts`, `src/webhook-signature.ts`, `src/logger.ts`,
+`src/config.ts`, `src/scheduling.ts`, `src/agenda-actor.ts`, `telnyx.toml`,
+`telnyx-env.d.ts`, `package.json`, any other source or test file.
+
+### Behavior changes (visible on the wire / in logs)
+
+- Wire: **none**. Every key/secret infrastructure failure still produces
+  `503 { "error": "service_unavailable" }`. `401 { "error": "unauthorized" }`
+  on signature mismatch is unchanged.
+- Logs: `webhook.rejected.reason` now carries one of
+  `secrets_binding_missing`, `key_timeout`, `key_empty`, `key_read_failed`,
+  or `verification_configuration_invalid` instead of the single
+  `key_unavailable`. The `http_status` field is unchanged (503 for all
+  five).
+- The 200ms key-read deadline is unchanged.
+
+### Limitations of this check
+
+- Local mocked tests only. No remote-runtime evidence; no deployment; no
+  signed delivery against the deployed verifier.
+- The wire response remains `503` for all five reasons by design — a
+  caller cannot distinguish them. The distinction lives in the log line,
+  which requires operator access to the runtime logs to be useful.
+
+## 5.x.c — Key-read timeout raised from 200 ms to 500 ms (unverified remote adjustment)
+
+**Date:** 2026-10-17
+**Scope:** Local-only source change to `WEBHOOK_KEY_WAIT_MS` (200 → 500 ms).
+Comment updates, two new focused tests (300 ms-resolving success path and
+boundary check that the deadline is now 500 ms), no remote verification.
+**Not claimed:** that the deployed function will resolve the webhook key in
+under 500 ms, that this change fixes the 5.x 503 outcome, or that the
+remote runtime reads this constant at all. This is a code-only adjustment
+shipped through the next `telnyx-edge ship`; it is **not** a confirmed fix.
+
+### Motivation (recap of prior evidence)
+
+The 5.x / 5.x.a evidence records noted that the 503 function time on the
+deployed runtime was ~200–250 ms, which is consistent with the 200 ms
+deadline firing. Raising the local deadline gives the secrets lookup more
+slack before the handler fails closed; whether it actually resolves the
+remote 503 is unknown until a signed delivery is sent.
+
+### Implementation
+
+- `src/dynamic-variables.ts`:
+  - `WEBHOOK_KEY_WAIT_MS = 200` → `500`.
+  - The three related comments (`200ms deadline` in the
+    `loadWebhookKeyBounded` doc, `bounded (200ms)` in the handler's pre-KV
+    verification note, and the constant's own surrounding comment) updated
+    to `500`/`500ms` so the source stays internally consistent.
+- No other source file changed. `CONFIG_WAIT_MS` (800 ms) is unchanged —
+  the config and key timeouts remain independent.
+- Authentication, timer cleanup, late-rejection handling, the
+  `.then(_, onRejected)` pair that consumes async rejections, and the
+  surrounding `try` that catches synchronous throws from `secrets.get`
+  are all unchanged.
+
+### New tests (added to the existing `key read never settles` describe block)
+
+| Scenario | Pass |
+|---|---|
+| Key unresolved; advancing only 200 ms leaves the handler pending (old deadline no longer fires). | ✓ |
+| Same scenario; advancing to 500 ms returns 503 with `reason: "key_timeout"` exactly once; a late resolve after the deadline does not emit a second rejection. | ✓ |
+| Key resolves at 300 ms; handler proceeds to signature verification and returns 200 with the dynamic-variables payload; no `webhook.rejected` event. | ✓ |
+
+The 300 ms success-path test signs the body with the test keypair so a
+genuinely valid signature reaches the verifier and yields 200. This proves
+that a 300 ms lookup now passes through, where it would have been cut off
+at the previous 200 ms deadline.
+
+The existing tests for the four 503 branches (`secrets_binding_missing`,
+`key_empty`, `key_read_failed` for promise rejection and synchronous
+throw, `verification_configuration_invalid`) and the two "late rejection"
+tests were not modified — they assert wire outcomes and log reasons that
+are independent of the new deadline.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `src/dynamic-variables.ts` | `WEBHOOK_KEY_WAIT_MS` 200 → 500; three related comments updated |
+| `test/webhook.test.ts` | Describe-block label, test name, comment updated from 200 ms → 500 ms; two new tests added (200 ms no-fire + 500 ms boundary, 300 ms resolve → 200) |
+| `docs/verification.md` | This evidence record |
+
+Not changed: `src/index.ts`, `src/webhook-signature.ts`, `src/logger.ts`,
+`src/config.ts`, `src/scheduling.ts`, `src/agenda-actor.ts`, `telnyx.toml`,
+`telnyx-env.d.ts`, `package.json`. The pre-existing architecture/README
+references to "200 ms" / "WEBHOOK_KEY_WAIT_MS = 200" remain stale (they
+predate this subtask and are out of the explicit scope of this change).
+
+### Check results
+
+- `npm run typecheck` (`tsc --noEmit`) → **0 errors**
+- `npm run test` (`vitest run`) → **520/520 passed** across 14 files
+  (518 prior + 2 new — the two tests added by this subtask)
+
+### Behavior changes (local-only, unverified remote)
+
+- Local handler: the key-read deadline is 500 ms. A lookup that resolves
+  in 300 ms now reaches the verifier; one that never settles is reported
+  as `key_timeout` after 500 ms (instead of 200 ms).
+- Remote handler: unchanged by this commit alone. The deployed bundle
+  still uses the previous 200 ms value until the next `telnyx-edge ship`.
+- HTTP wire outcomes for all key/secret paths are unchanged (`503
+  { "error": "service_unavailable" }` for the four infrastructure
+  branches; `401` for signature mismatch).
+
+### What is NOT verified by this subtask
+
+- That the remote runtime's secrets lookup actually completes inside 500 ms
+  when the previous 200 ms was insufficient. The 5.x.a evidence recorded
+  ~200–250 ms function time, which is consistent with either the previous
+  deadline firing or with key loading + verifier returning
+  `invalid_configuration` quickly. Both hypotheses remain open.
+- Whether this adjustment fixes the 5.x 503 outcome at all. A signed
+  delivery against the deployed endpoint (after a `telnyx-edge ship` of
+  this change) is still required to confirm.
+- The behavior of the remote `WEBHOOK_KEY_WAIT_MS` constant on its own —
+  remote dispatch, secrets-binding resolution latency, and the
+  verifier's behavior under any key value remain unproven.
+
+This subtask does **not** add, retrieve, or print any secret value, does
+not read `.env`, does not modify remote KV, does not create bookings,
+does not install any dependency, does not deploy, and does not commit.
+
+## 5.x.d — Key-lookup completion diagnostic event (local-only)
+
+**Date:** 2026-10-17
+**Scope:** Local-only source change to `loadWebhookKeyBounded` in
+`src/dynamic-variables.ts`. When the underlying `secrets.get` operation
+settles — even after the 500 ms timeout has already returned 503 — emit
+exactly one structured event `webhook.key_lookup_completed` with only
+`outcome` ("ok" / "empty" / "read_failed"), `elapsed_ms`, and
+`after_timeout`. All HTTP responses, status codes, body shapes, and
+authentication behavior are unchanged.
+**Not claimed:** remote-runtime evidence. The deployed function does not
+emit this event yet; no deployment, no remote requests, no `.env` access,
+no secret retrieval, no commit. The remote cause of the 5.x 503 and the
+remote lookup latency remain unknown — only a `telnyx-edge ship` plus a
+signed delivery against the deployed endpoint can confirm them.
+
+### Motivation
+
+The 5.x branch enumeration collapsed to a single `503
+{ "error": "service_unavailable" }` on the wire, and the existing
+`webhook.rejected.reason` only fires when the *handler* observes a
+failure. A lookup that loses the race to the 500 ms timer was previously
+invisible: the secret store could keep resolving seconds later and no
+runtime log would record it. The new event closes that gap by observing
+the underlying `secrets.get` promise itself, so an operator can see what
+the lookup actually did and how long it took even if the response was
+already on the wire.
+
+### Implementation (`src/dynamic-variables.ts`)
+
+- `loadWebhookKeyBounded` records `startMs = Date.now()` at the start of
+  the call and a `timedOut` flag flipped to `true` when the 500 ms timer
+  fires.
+- The wrapper around `secrets.get("WEBHOOK_PUBLIC_KEY")` is unchanged
+  (sync throw caught by the surrounding `try`; `.then(_, onRejected)`
+  pair converts a promise rejection to `{ ok: false,
+  reason: "key_read_failed" }`).
+- A second `keyPromise.then(...)` attachment observes the **underlying**
+  lookup promise after it has been mapped to its `{ ok, key } /
+  { ok: false, reason }` shape. Because the wrapper provides both
+  fulfillment and rejection handlers, `keyPromise` itself never rejects,
+  so this attachment cannot escape as an unhandled rejection.
+- When the wrapper settles, the attachment emits
+  `webhook.key_lookup_completed` with `outcome` mapped from the wrapper
+  result (`ok` / `empty` / `read_failed`), the elapsed time since
+  `startMs`, and the current `timedOut` flag (so a late settle is
+  recorded as `after_timeout: true`).
+- The synchronous-throw branch emits the event inline before returning
+  `key_read_failed`, because there is no underlying promise to observe.
+- The 500 ms timeout (`WEBHOOK_KEY_WAIT_MS`) is unchanged. The race
+  between `keyPromise` and `timeoutPromise`, the timer cleanup, and the
+  existing rejection-suppression semantics are unchanged. No retry, no
+  extra secret read, no leaked value: the event carries only the three
+  documented fields, never the key, its length, headers, bodies, or raw
+  error messages.
+
+### Event shape
+
+```json
+{
+  "ts": "...",
+  "event": "webhook.key_lookup_completed",
+  "outcome": "ok" | "empty" | "read_failed",
+  "elapsed_ms": <number, ≥ 0>,
+  "after_timeout": <boolean>
+}
+```
+
+Mapping:
+
+| Underlying settle | Wrapper result | `outcome` |
+|---|---|---|
+| Resolves to a non-empty string | `{ ok: true, key }` | `"ok"` |
+| Resolves to an empty string or non-string | `{ ok: false, reason: "key_empty" }` | `"empty"` |
+| Resolves to a non-string value (e.g. number) | `{ ok: false, reason: "key_empty" }` | `"empty"` |
+| Promise rejects | `{ ok: false, reason: "key_read_failed" }` | `"read_failed"` |
+| `secrets.get` throws synchronously | (no wrapper) | `"read_failed"` |
+| Still pending when the 500 ms timer fires | (handler returns 503) | (no event yet) |
+
+`after_timeout` is `true` only for events emitted after the timer has
+fired; events emitted before the timer fires (the common case) have
+`after_timeout: false`. Events are emitted at most once per call to
+`loadWebhookKeyBounded`.
+
+### Mocked test coverage (`test/webhook.test.ts`)
+
+A new describe block —
+`/webhooks/dynamic-variables — key lookup completion diagnostic` — adds
+four focused tests:
+
+| Scenario | `outcome` | `after_timeout` | Pass |
+|---|---|---|---|
+| Valid key resolves before the 500 ms deadline | `"ok"` | `false` | ✓ |
+| Key resolves **after** the 500 ms deadline (late success) | `"ok"` | `true` | ✓ |
+| Key rejects **after** the 500 ms deadline (late rejection, no unhandled rejection) | `"read_failed"` | `true` | ✓ |
+| `secrets.get` throws synchronously | `"read_failed"` | `false` | ✓ |
+
+Each test asserts:
+
+- exactly one `webhook.key_lookup_completed` event is emitted;
+- the three documented fields have the expected values;
+- `elapsed_ms` is a finite non-negative number;
+- the serialized event never contains the key's base64 form, the request
+  phone, the string `"Error"`, or `"stack"` (so the log line cannot leak
+  the underlying error or its stack trace).
+
+The late-rejection test additionally captures `process.on("unhandledRejection")`
+for the duration of the case to prove the late settle does not escape as
+an unhandled rejection — the wrapper's `.then(_, onRejected)` pair
+continues to suppress it.
+
+The pre-existing `key read never settles` tests, the
+`diagnostic labels for key/secret failures` suite, and the privacy
+assertion ("no phone, key bytes, body, or error message in any log
+line") were not modified — the new event's strict field set is
+independent of those reasons and labels.
+
+### Check results
+
+- `npm run typecheck` (`tsc --noEmit`) → **0 errors**
+- `npm test` (`vitest run`) → **524/524 passed** across 14 files
+  (520 prior + 4 new completion-diagnostic tests)
+- Changed files: `src/dynamic-variables.ts`,
+  `test/webhook.test.ts`, `docs/verification.md`
+- Not changed: `src/index.ts`, `src/webhook-signature.ts`, `src/logger.ts`,
+  `src/config.ts`, `src/scheduling.ts`, `src/agenda-actor.ts`,
+  `src/conversation-actor.ts`, `src/bookings.ts`, `src/booking-service.ts`,
+  `src/availability.ts`, `src/mcp-server.ts`, `telnyx.toml`,
+  `telnyx-env.d.ts`, `package.json`.
+
+### Behavior changes (local-only, unverified remote)
+
+- Wire: **none**. Every key/secret infrastructure failure still produces
+  `503 { "error": "service_unavailable" }`; valid signatures still produce
+  `200`. The 500 ms deadline is unchanged.
+- Logs: a new structured event `webhook.key_lookup_completed` is emitted
+  exactly once per request, alongside the existing `webhook.rejected` /
+  `webhook.dynamic_variables` line. The event carries only
+  `outcome` / `elapsed_ms` / `after_timeout`; no key value, length, body,
+  header, or raw error message is logged.
+- The handler does not retry, perform an extra secret read, or change its
+  ordering on the key path. The new observation is purely a logging
+  attachment on the existing `keyPromise`.
+
+### What is NOT verified by this subtask
+
+- **The remote cause of the 5.x 503 remains unknown.** This subtask adds
+  a logging signal but does not deploy it. The deployed bundle still
+  behaves exactly as it did after the 5.x.c change (200 ms → 500 ms
+  timeout, four 503-producing reasons on the wire). A `telnyx-edge ship`
+  plus a signed delivery against the deployed endpoint is required to
+  observe `webhook.key_lookup_completed` and to determine whether the
+  remote `secrets.get` resolves inside 500 ms or whether the late-settle
+  path is the operative case.
+- **The remote lookup latency remains unknown.** Local mocked tests
+  measure elapsed time against fake timers and a mocked secrets store;
+  they cannot speak to the real `secrets.get` round trip on the deployed
+  runtime. Whether the late-success / late-rejection branch fires in
+  production will only be visible after a ship.
+- **The remote branch enumeration is unchanged.** The
+  `secrets_binding_missing` / `key_timeout` / `key_empty` /
+  `key_read_failed` / `verification_configuration_invalid` set is
+  unchanged on the wire; the new event complements `key_timeout` /
+  `key_read_failed` (the two branches where `secrets.get` itself is
+  slow or fails) but does not add or remove any branch.
+- **No remote-runtime evidence is claimed.** No deployment, no signed
+  delivery, no remote request, no `.env` access, no secret retrieval.
+
+This subtask does **not** add, retrieve, or print any secret value, does
+not read `.env`, does not modify remote KV, does not create bookings,
+does not install any dependency, does not deploy, and does not commit.
+
+## 5.x.e — Key-read timeout raised from 500 ms to 1000 ms; remote evidence that the lookup completes at 677 ms
+
+**Date:** 2026-10-17
+**Scope:** Local-only source change to `WEBHOOK_KEY_WAIT_MS` (500 → 1000 ms)
+in `src/dynamic-variables.ts`. Comment updates, two updated tests (the
+"old deadline no longer fires" boundary test and the `key_timeout when the
+1000ms deadline fires first` label), one new regression test
+(`key resolving at 677ms → 200`), no remote verification.
+**Not claimed:** that the deployed function's key value is well-formed,
+that the verifier has been observed running with a valid key on the
+remote runtime, or that any real Telnyx signature has been remotely
+validated. The remote completion time and the remote 503 wall-clock are
+user-observed runtime facts (logged on the deployed bundle); nothing
+about the key value, its base64 form, the Ed25519-point validity, or the
+verifier's behavior on a real signature is being asserted by this
+subtask.
+
+### User-observed remote evidence (informal runtime record)
+
+The user captured the following two events from the deployed bundle's
+runtime logs during a single 5.x.b / 5.x.d observation window:
+
+| t (ms from request start) | Event | Detail |
+|---|---|---|
+| 503 | `webhook.rejected` | `reason: "key_timeout"`, `http_status: 503` |
+| 677 | `webhook.key_lookup_completed` | `outcome: "ok"`, `after_timeout: true` |
+
+**What this evidence supports (and what it does not):**
+
+- The remote secrets lookup eventually **resolves successfully** (the
+  completion event carries `outcome: "ok"`, meaning the underlying
+  `secrets.get("WEBHOOK_PUBLIC_KEY")` settled with a non-empty string).
+  This confirms that `secrets_binding_missing` (branch 1) and
+  `key_empty` (branch 2b) are **not** the cause of the 503 on the
+  deployed endpoint — the lookup returns a usable key.
+- The lookup resolves **174 ms after the 500 ms deadline fires** (677 ms
+  vs. 503 ms). With the previous 500 ms deadline, this lookup could
+  never reach signature verification in time: the handler returns 503
+  on the wire at 503 ms, while the underlying promise settles 174 ms
+  later. Raising the deadline to 1000 ms gives 323 ms of additional
+  slack past the observed completion time, so a future request where
+  the same lookup takes up to ~1000 ms will reach the verifier instead
+  of failing closed.
+- The handler's completion-diagnostic attachment works as designed: the
+  late `after_timeout: true` settle was recorded even though the wire
+  response had already been sent at 503 ms.
+
+**What this evidence does NOT support:**
+
+- **Key format.** The remote `outcome: "ok"` only proves the
+  `secrets.get` promise resolved with a non-empty string. It does not
+  prove the bytes are valid base64, that the decoded buffer has the
+  Ed25519 public-key length (32 bytes), that `crypto.subtle.importKey`
+  accepts them as a valid Ed25519 point, or that the verifier produces
+  `valid` instead of `invalid_configuration` against any specific
+  signature. Branches 3c / 3d / 3e in the 5.x enumeration remain
+  open and cannot be excluded from this evidence.
+- **Real signature verification.** The 677 ms completion event was
+  recorded on an unsigned request (the only kind of request this
+  subtask can produce without operator access to a private key that
+  matches the deployed `WEBHOOK_PUBLIC_KEY`). The verifier never ran;
+  `verifyWebhookSignature` was not observed to return `valid`,
+  `invalid_signature`, or `invalid_configuration` against any real
+  Telnyx signature.
+- **Root-cause claim.** This evidence is consistent with the
+  hypothesis "the remote 503 is caused by the 500 ms deadline firing
+  before the lookup settles, and a longer deadline would let the
+  lookup through to the verifier". It is also consistent with the
+  hypothesis "the verifier would still return `invalid_configuration`
+  on the key value, and the request would still 503 even with the
+  longer deadline". The two are not distinguishable without either a
+  signed delivery or runtime logs showing the verifier's verdict.
+- **The exact 503 ms / 677 ms numbers as universal truth.** A single
+  observation is a sample, not a measurement; lookup latency on the
+  deployed runtime may vary with cold starts, secret-store region,
+  TLS handshake cost, and other factors.
+
+### Motivation (recap of prior evidence)
+
+The 5.x.c change raised the local deadline to 500 ms on the assumption
+that the 200 ms deadline was firing prematurely. The 5.x.c record
+explicitly noted: *"Whether this adjustment fixes the 5.x 503 outcome
+at all. A signed delivery against the deployed endpoint (after a
+`telnyx-edge ship` of that change) is still required to confirm."*
+The 5.x.d completion-diagnostic event was added precisely to surface
+late settles in runtime logs. The user-observed evidence above is the
+first concrete runtime data point that the lookup settles after the
+500 ms deadline (at 677 ms), which is **why this subtask raises the
+deadline further to 1000 ms** — to keep the 677 ms lookup inside the
+budget.
+
+### Implementation
+
+- `src/dynamic-variables.ts`:
+  - `WEBHOOK_KEY_WAIT_MS = 500` → `1000`.
+  - Three related comments updated:
+    - The `loadWebhookKeyBounded` doc comment's opening line
+      (`"500ms deadline"` → `"1000ms deadline"`).
+    - The "Diagnostic timing" paragraph in the same doc
+      (`"even if the 500ms timeout"` → `"even if the 1000ms timeout"`).
+    - The handler's pre-KV verification note (`"bounded (500ms)"` →
+      `"bounded (1000ms)"`).
+  - No other source change. `CONFIG_WAIT_MS` (800 ms) is unchanged —
+    the config and key timeouts remain independent.
+- `test/webhook.test.ts`:
+  - Describe-block label `"key read never settles (500ms deadline)"` →
+    `"key read never settles (1000ms deadline)"`.
+  - Helper comment `"stranded past our 500ms window"` → `"stranded past
+    our 1000ms window"`.
+  - Test name `"times out at 500ms → 503"` → `"times out at 1000ms →
+    503"`.
+  - Boundary test `"times out after 500ms (not 200ms) — advancing only
+    200ms keeps the read pending"` → `"times out after 1000ms (not
+    500ms) — advancing only 500ms keeps the read pending"`. The advance
+    steps change accordingly: 500 ms (old deadline, must not fire) +
+    500 ms (to the new 1000 ms mark, must fire).
+  - `key resolving at 300ms → 200` test: comment updated to reference
+    the 1000 ms deadline (the test itself still passes — 300 ms beats
+    any deadline in the range).
+  - Diagnostic timing section's header comment `"even if the 500ms
+    timeout"` → `"even if the 1000ms timeout"`.
+  - `key_timeout when the 500ms deadline fires first` →
+    `key_timeout when the 1000ms deadline fires first`.
+  - **New regression test:** `key resolving at 677ms reaches signature
+    verification → 200`. Asserts the handler does not fire at 500 ms
+    (the previous deadline), then advances 177 ms more to 677 ms and
+    resolves the lookup with the test's `keyPair.publicKeyBase64`.
+    With the test body signed against that keypair, the handler
+    reaches `verifyWebhookSignature` and returns 200 with the
+    dynamic-variables payload, with no `webhook.rejected` event.
+- `docs/architecture.md`:
+  - Two failure-mode bullets updated (`>200 ms` → `>1000 ms`,
+    `WEBHOOK_KEY_WAIT_MS = 200` → `WEBHOOK_KEY_WAIT_MS = 1000`).
+  - Heading `"200 ms bounded secrets wait"` →
+    `"1000 ms bounded secrets wait"`.
+
+Not changed: `src/index.ts`, `src/webhook-signature.ts`, `src/logger.ts`,
+`src/config.ts`, `src/scheduling.ts`, `src/agenda-actor.ts`,
+`src/conversation-actor.ts`, `src/bookings.ts`, `src/booking-service.ts`,
+`src/availability.ts`, `src/mcp-server.ts`, `telnyx.toml`,
+`telnyx-env.d.ts`, `package.json`, `README.md`. The 5.x.b section in
+this file (`/docs/verification.md`) intentionally retains references
+to the 200 ms timeout it was scoped to document.
+
+### Preserved behavior
+
+- Authentication, signature verification, body parsing, KV access,
+  response shapes, and status codes are unchanged. The 1000 ms
+  deadline only changes how long the handler will wait for the
+  `secrets.get` to resolve.
+- Timer cleanup: the `setTimeout` handle is cleared once the race
+  settles, regardless of which side won. The 1000 ms cap on the
+  artificial timer is the only thing that changed; the cleanup path
+  is unchanged.
+- Late rejection handling: the `.then(_, onRejected)` pair on the
+  read promise continues to convert a promise rejection into
+  `{ ok: false, reason: "key_read_failed" }`, and the synchronous
+  throw from `secrets.get` is still caught by the surrounding `try`.
+- Completion diagnostics: the `key_lookup_completed` event
+  (added in 5.x.d) is unchanged in shape, fields, and emission
+  semantics. `after_timeout: true` events still fire when the lookup
+  settles after the timer; with the 1000 ms deadline, fewer lookups
+  will hit that branch because the 677 ms observed lookup now
+  resolves before the deadline.
+- `CONFIG_WAIT_MS = 800` is unchanged. The config and key timeouts
+  remain independent.
+- The existing four 503 branches (`secrets_binding_missing`,
+  `key_empty`, `key_read_failed`, `verification_configuration_invalid`)
+  are unchanged on the wire.
+
+### New + updated tests
+
+| Scenario | Pass |
+|---|---|
+| Key unresolved; advancing only 500 ms leaves the handler pending (the previous deadline no longer fires). | ✓ |
+| Same scenario; advancing to 1000 ms returns 503 with `reason: "key_timeout"` exactly once; a late resolve after the deadline does not emit a second rejection. | ✓ |
+| Key resolves at 300 ms; handler proceeds to signature verification and returns 200 with the dynamic-variables payload; no `webhook.rejected` event. | ✓ (unchanged) |
+| **New:** key resolves at 677 ms (the remote observation); handler does not fire at 500 ms; the resolved key reaches `verifyWebhookSignature` and the signed request returns 200; no `webhook.rejected` event. | ✓ |
+| Diagnostic timing describe block: existing four `key_lookup_completed` tests are unchanged and still pass against the new 1000 ms deadline. | ✓ |
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `src/dynamic-variables.ts` | `WEBHOOK_KEY_WAIT_MS` 500 → 1000; three related comments updated |
+| `test/webhook.test.ts` | Describe-block label, helper comment, three test names/comments updated from 500 ms → 1000 ms; one new regression test added (677 ms resolve → 200) |
+| `docs/architecture.md` | Two failure-mode bullets + one section heading updated from 200 ms → 1000 ms |
+| `docs/verification.md` | This evidence record |
+
+Not changed: `src/index.ts`, `src/webhook-signature.ts`, `src/logger.ts`,
+`src/config.ts`, `src/scheduling.ts`, `src/agenda-actor.ts`,
+`src/conversation-actor.ts`, `src/bookings.ts`, `src/booking-service.ts`,
+`src/availability.ts`, `src/mcp-server.ts`, `telnyx.toml`,
+`telnyx-env.d.ts`, `package.json`, `README.md`. The 5.x.b section in
+this file intentionally retains references to the 200 ms timeout it
+was scoped to document.
+
+### Check results
+
+- `npm run typecheck` (`tsc --noEmit`) → **0 errors**
+- `npm test` (`vitest run`) → **525/525 passed** across 14 files
+  (524 prior + 1 new — the `677 ms resolve → 200` regression test)
+
+### Behavior changes (local-only, unverified remote)
+
+- Local handler: the key-read deadline is 1000 ms. A lookup that
+  resolves in 677 ms (the user-observed remote value) now reaches
+  the verifier; one that never settles is reported as `key_timeout`
+  after 1000 ms (instead of 500 ms).
+- Remote handler: unchanged by this commit alone. The deployed bundle
+  still uses the previous 500 ms value until the next
+  `telnyx-edge ship`.
+- HTTP wire outcomes for all key/secret paths are unchanged (`503
+  { "error": "service_unavailable" }` for the four infrastructure
+  branches; `401` for signature mismatch; `200` for a valid signature).
+- Structured-log fields and event shapes are unchanged:
+  `webhook.rejected.reason`, `webhook.key_lookup_completed.outcome /
+  elapsed_ms / after_timeout`, and the success-line
+  `webhook.dynamic_variables.*` are byte-for-byte identical to the
+  5.x.d shape.
+
+### What is NOT verified by this subtask
+
+- That the deployed function's `WEBHOOK_PUBLIC_KEY` value is well-formed
+  (valid base64, 32 decoded bytes, a valid Ed25519 point). The
+  `outcome: "ok"` on the 677 ms completion event only proves the value
+  is a non-empty string; it does not prove any of the above.
+- That the verifier returns `valid` (rather than
+  `invalid_configuration`) against any real Telnyx signature.
+  `verifyWebhookSignature` has not been observed running with a valid
+  key on the remote runtime; only its absence (the 503 path) has been
+  observed.
+- That raising the deadline to 1000 ms actually fixes the 5.x 503
+  outcome on the deployed endpoint. A `telnyx-edge ship` of this change
+  plus a subsequent runtime observation is still required to confirm.
+- The exact 503 ms / 677 ms values as universal truth. These are a
+  single sample from the deployed runtime; they may shift with cold
+  starts, region, or secret-store load.
+
+This subtask does **not** add, retrieve, or print any secret value,
+does not read `.env`, does not modify remote KV, does not create
+bookings, does not install any dependency, does not deploy, and does
+not commit.

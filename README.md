@@ -79,16 +79,21 @@ Three tools, all bound to the same MCP server (stateless per-request):
 `today_weekday`, `now_local_time`, `business_hours`, `service_list`). KV config
 load is raced against an **800 ms** deadline; missing/slow/loaded-failed
 config returns `200` with `system_status: "degraded"` and
-`booking_enabled: "false"`. The endpoint is currently unauthenticated (returns
-only non-sensitive business info). Webhook signature verification is a pending
-follow-up.
+`booking_enabled: "false"`. Every delivery is authenticated against the
+Ed25519 public key stored in the `WEBHOOK_PUBLIC_KEY` secret binding
+(`TELNYX_PUBLIC_KEY`); the verifier verifies `${timestamp}|${rawBody}` and
+enforces a ±300 s replay window. A missing or slow secret lookup, a malformed
+key, or an `invalid_configuration` from `crypto.subtle` fails closed with
+`503 { error: "service_unavailable" }`; an unverified signature returns
+`401 { error: "unauthorized" }`. See `src/webhook-signature.ts` and
+`src/dynamic-variables.ts`.
 
 ## Local commands
 
 ```bash
 npm install
 npm run typecheck    # tsc --noEmit (strict mode) — 0 errors
-npm test             # vitest run (mocked) — 377/377 passing
+npm test             # vitest run (mocked) — 510/510 passing (14 files)
 ```
 
 ### Local runtime (verified historical probe)
@@ -136,14 +141,15 @@ https://servicedesk-ai-a666861a-1.telnyxcompute.com
 All recorded remote checks happened against this URL. The three MCP tools,
 the `/demo/*` route set (config / availability / bookings), and the public
 boundaries all have recorded deployment evidence (see `docs/verification.md`
-subtasks 1.5.4, 1.5.5, 2.2d, 2.3e, 2.4d, 3.1b, 3.3). Local changes after that
-evidence — the `dynamic-variables` webhook extraction **and** the
+subtasks 1.5.4, 1.5.5, 2.2d, 2.3e, 2.4d, 3.1b, 3.3). The 2026-10-16 subtask
+3.3 evidence refers to the old content-derived key
+(`sha256(phone|date|time|service_id)`) and is preserved as historical, not as
+proof of the conversation-Actor implementation. The 2026-10-17 ship
+(subtask 5.x in `docs/verification.md`) deployed the
+`dynamic-variables` webhook with Ed25519 signature verification and the
 `ConversationBooking` Actor routing that replaced the old content-derived
-MCP idempotency key — are **not claimed deployed**; re-run `telnyx-edge
-ship` before relying on them remotely. The 2026-10-16 subtask 3.3 evidence
-refers to the old content-derived key (`sha256(phone|date|time|service_id)`)
-and is preserved as historical, not as proof of the conversation-Actor
-implementation.
+MCP idempotency key; that subtask also records the unauthenticated remote
+checks performed against the live URL.
 
 ## Secret bindings (separate, never recorded)
 
@@ -152,6 +158,10 @@ one surface:
 
 - `[[secrets]] SMOKE_AUTH = "SMOKE_TEST_TOKEN"` — protects `/demo/*`.
 - `[[secrets]] MCP_AUTH = "MCP_API_TOKEN"` — protects `/mcp`.
+- `[[secrets]] WEBHOOK_PUBLIC_KEY = "TELNYX_PUBLIC_KEY"` — Ed25519 public key
+  (base64, 32 bytes) used to verify the `telnyx-signature-ed25519` header on
+  `/webhooks/dynamic-variables`. The matching private key lives in Mission
+  Control; this repo never sees it.
 
 Token values are never committed, logged, or echoed in responses. Before remote
 smoke tests:
@@ -173,7 +183,10 @@ Failure modes (intentionally distinct):
   tool result text is `service_unavailable` or the domain error code).
 - `/webhooks/dynamic-variables` KV wait timeout / load failure / absent
   binding → HTTP `200` with `system_status: "degraded"` and
-  `booking_enabled: "false"` (never blocks the caller).
+  `booking_enabled: "false"` (never blocks the caller). Missing / malformed
+  / late `WEBHOOK_PUBLIC_KEY` lookup or `crypto.subtle` failure → HTTP
+  `503 { error: "service_unavailable" }`; unverified signature → HTTP
+  `401 { error: "unauthorized" }`.
 
 ## Logging and PII
 
@@ -184,9 +197,6 @@ route.
 ## Pending (not implemented)
 
 - Voice AI Assistant / Conversation Workflow / phone-number integration.
-- Webhook signature verification on `/webhooks/dynamic-variables` (the
-  endpoint is currently unauthenticated; authenticity, monitoring, and
-  the workflow task remain pending and unchanged in scope).
 - Monitoring, alerts, and an operations portal.
 
 ## Official source URLs

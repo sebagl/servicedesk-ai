@@ -9,6 +9,7 @@ vi.mock("@telnyx/edge-runtime", () => ({
 import handler from "../src/index";
 import type { AppConfig } from "../src/config";
 import { maskPhone } from "../src/logger";
+import { __resetWebhookKeyCacheForTests } from "../src/dynamic-variables";
 
 const VALID_CONFIG: AppConfig = {
   services: [
@@ -261,6 +262,7 @@ let logSpy: ReturnType<typeof vi.spyOn>;
 beforeEach(async () => {
   logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
   keyPair = await generateKeyPair();
+  __resetWebhookKeyCacheForTests();
 });
 
 afterEach(() => {
@@ -967,7 +969,7 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
     expect((await res.json())).toEqual({ error: "service_unavailable" });
     expect(env.CONFIG!.get).not.toHaveBeenCalled();
     const ev = findEvent("webhook.rejected");
-    expect(ev?.reason).toBe("key_unavailable");
+    expect(ev?.reason).toBe("secrets_binding_missing");
     expect(ev?.http_status).toBe(503);
   });
 
@@ -980,7 +982,7 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
     expect(res.status).toBe(503);
     expect(env.CONFIG!.get).not.toHaveBeenCalled();
     const ev = findEvent("webhook.rejected");
-    expect(ev?.reason).toBe("key_unavailable");
+    expect(ev?.reason).toBe("key_read_failed");
     expect(ev?.http_status).toBe(503);
   });
 
@@ -993,7 +995,7 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
     expect(res.status).toBe(503);
     expect(env.CONFIG!.get).not.toHaveBeenCalled();
     const ev = findEvent("webhook.rejected");
-    expect(ev?.reason).toBe("key_unavailable");
+    expect(ev?.reason).toBe("verification_configuration_invalid");
     expect(ev?.http_status).toBe(503);
   });
 
@@ -1011,9 +1013,12 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
     );
     expect(res.status).toBe(503);
     expect(env.CONFIG!.get).not.toHaveBeenCalled();
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_empty");
+    expect(ev?.http_status).toBe(503);
   });
 
-    describe("key read never settles (200ms deadline)", () => {
+    describe("key read never settles (1000ms deadline)", () => {
     beforeEach(() => {
       vi.useFakeTimers({
         toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
@@ -1039,7 +1044,7 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
 
     // Advance fake time until the handler completes (or the cap is hit) so
     // a slow body read or signature verification cannot leave a scheduled
-    // timer stranded past our 200ms window.
+    // timer stranded past our 1000ms window.
     async function advanceUntilResolved<T>(
       promise: Promise<T>,
       stepMs = 25,
@@ -1057,7 +1062,7 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
       }
     }
 
-    it("times out at 200ms → 503, no CONFIG access, no unhandled rejection", async () => {
+    it("times out at 1000ms → 503, no CONFIG access, no unhandled rejection", async () => {
       const ps = pendingSecrets(validKv(VALID_CONFIG));
       let resolved = false;
       const promise = handler
@@ -1072,9 +1077,113 @@ describe("/webhooks/dynamic-variables — secret key binding", () => {
       expect((await res.json())).toEqual({ error: "service_unavailable" });
       expect(ps.env.CONFIG!.get).not.toHaveBeenCalled();
       const ev = findEvent("webhook.rejected");
-      expect(ev?.reason).toBe("key_unavailable");
+      expect(ev?.reason).toBe("key_timeout");
       expect(ev?.http_status).toBe(503);
       expect(resolved).toBe(true);
+    });
+
+    it("times out after 1000ms (not 500ms) — advancing only 500ms keeps the read pending", async () => {
+      // Reproduce the key/secret timeout with bounded fake-time progress so
+      // the test can observe exactly when the deadline fires. The handler
+      // must still be waiting at 500ms (the previous deadline) and must
+      // return 503 with key_timeout only after the 1000ms mark.
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const promise = handler
+        .fetch(await webhookReq(initPayload("+15550000320")), ps.env as never)
+        .then((r) => r);
+      // 500ms (the old deadline) must NOT settle the request.
+      await vi.advanceTimersByTimeAsync(500);
+      await new Promise<void>((resolve) => process.nextTick(resolve));
+      let settled = false;
+      promise.then(() => { settled = true; }, () => { settled = true; });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      // Advancing further to 1000ms must fire the deadline and produce 503.
+      await vi.advanceTimersByTimeAsync(500);
+      await advanceUntilResolved(promise);
+      const res = await promise;
+      expect(res.status).toBe(503);
+      const ev = logEvents()
+        .filter((e) => e.event === "webhook.rejected")
+        .slice(-1)[0];
+      expect(ev?.reason).toBe("key_timeout");
+      expect(ev?.http_status).toBe(503);
+      // Late resolve after timeout must not change the recorded outcome.
+      ps.resolve(keyPair.publicKeyBase64);
+      await vi.advanceTimersByTimeAsync(0);
+      await new Promise<void>((resolve) => process.nextTick(resolve));
+      const rejections = logEvents().filter(
+        (e) => e.event === "webhook.rejected",
+      );
+      expect(rejections).toHaveLength(1);
+    });
+
+    it("key resolving at 300ms reaches signature verification → 200", async () => {
+      // A key that resolves at 300ms must beat the 1000ms deadline and the
+      // handler must proceed to signature verification. The request body is
+      // signed with the test keypair, so a valid signature yields 200; this
+      // proves the slower lookup no longer accidentally trips the timeout.
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const promise = handler
+        .fetch(await webhookReq(initPayload("+15550000321")), ps.env as never)
+        .then((r) => r);
+      await vi.advanceTimersByTimeAsync(300);
+      ps.resolve(keyPair.publicKeyBase64);
+      await advanceUntilResolved(promise);
+      const res = await promise;
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        dynamic_variables: Record<string, string>;
+      };
+      expect(body.dynamic_variables.system_status).toBe("ok");
+      expect(body.dynamic_variables.booking_enabled).toBe("true");
+      // Only the success log should appear; no rejection.
+      const rejections = logEvents().filter(
+        (e) => e.event === "webhook.rejected",
+      );
+      expect(rejections).toHaveLength(0);
+      const ok = findEvent("webhook.dynamic_variables");
+      expect(ok?.reason).toBeUndefined();
+    });
+
+    it("key resolving at 677ms reaches signature verification → 200 (regression for remote completion latency)", async () => {
+      // Regression test: a key that resolves at 677ms (the completion time
+      // observed on the remote runtime after the 503 timeout fired) must
+      // still beat the 1000ms deadline and reach signature verification
+      // with a valid signed request. With the previous 500ms deadline this
+      // lookup would have been cut off as key_timeout; the 1000ms deadline
+      // proves the handler no longer returns 503 for late but valid keys.
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const promise = handler
+        .fetch(await webhookReq(initPayload("+15550000322")), ps.env as never)
+        .then((r) => r);
+      // 500ms (the previous deadline) must NOT settle the request.
+      await vi.advanceTimersByTimeAsync(500);
+      await new Promise<void>((resolve) => process.nextTick(resolve));
+      let settled = false;
+      promise.then(() => { settled = true; }, () => { settled = true; });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      // Resolve the lookup at 677ms — must beat the 1000ms deadline.
+      await vi.advanceTimersByTimeAsync(177);
+      ps.resolve(keyPair.publicKeyBase64);
+      await advanceUntilResolved(promise);
+      const res = await promise;
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        dynamic_variables: Record<string, string>;
+      };
+      expect(body.dynamic_variables.system_status).toBe("ok");
+      expect(body.dynamic_variables.booking_enabled).toBe("true");
+      // Only the success log should appear; no rejection.
+      const rejections = logEvents().filter(
+        (e) => e.event === "webhook.rejected",
+      );
+      expect(rejections).toHaveLength(0);
+      const ok = findEvent("webhook.dynamic_variables");
+      expect(ok?.reason).toBeUndefined();
     });
 
     it("key resolves after timeout → no extra log, no CONFIG read, no unhandled rejection", async () => {
@@ -1282,5 +1391,515 @@ describe("/webhooks/dynamic-variables — id validation", () => {
       (e) => e.event === "webhook.dynamic_variables",
     );
     expect(events).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Diagnostic labels — the four safe, distinct webhook.rejected reasons used
+// when the 503 is for an infrastructure problem on the key/secret path.
+// Each case must surface exactly one reason and never leak the key value,
+// the request body, or the underlying error message.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — diagnostic labels for key/secret failures", () => {
+  function syncThrowingSecrets(): WebhookEnv {
+    // Mirrors a binding that throws before returning a promise — e.g. an
+    // unwired handle on a backend that does not lazily wrap exceptions.
+    const secrets: SecretsMock = {
+      get: vi.fn((binding: string) => {
+        if (binding === "WEBHOOK_PUBLIC_KEY") {
+          throw new Error("sync boom");
+        }
+        throw new Error(`unexpected binding: ${binding}`);
+      }),
+    };
+    return { CONFIG: validKv(VALID_CONFIG), SECRETS: secrets };
+  }
+
+  function emptyKeySecrets(): WebhookEnv {
+    const secrets: SecretsMock = {
+      get: vi.fn(async (binding: string) => {
+        if (binding === "WEBHOOK_PUBLIC_KEY") return "";
+        throw new Error(`unexpected binding: ${binding}`);
+      }),
+    };
+    return { CONFIG: validKv(VALID_CONFIG), SECRETS: secrets };
+  }
+
+  function nonStringKeySecrets(): WebhookEnv {
+    // Resolves to a non-string value — the loader must reject this as
+    // key_empty rather than letting it reach the verifier.
+    const secrets = {
+      get: vi.fn((binding: string) => {
+        if (binding === "WEBHOOK_PUBLIC_KEY") {
+          return Promise.resolve(12345 as unknown as string);
+        }
+        return Promise.reject(new Error(`unexpected binding: ${binding}`));
+      }),
+    } as unknown as SecretsMock;
+    return { CONFIG: validKv(VALID_CONFIG), SECRETS: secrets };
+  }
+
+  it("secrets_binding_missing when env.SECRETS is undefined", async () => {
+    const env: WebhookEnv = { CONFIG: validKv(VALID_CONFIG) };
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000300")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json())).toEqual({ error: "service_unavailable" });
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("secrets_binding_missing");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("key_timeout when the 1000ms deadline fires first", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    try {
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const promise = handler.fetch(
+        await webhookReq(initPayload("+15550000301")),
+        ps.env as never,
+      );
+      let advanced = 0;
+      while (advanced < 5000) {
+        const settled = await Promise.race([
+          promise.then(() => true, () => true),
+          Promise.resolve(false),
+        ]);
+        if (settled) break;
+        await vi.advanceTimersByTimeAsync(25);
+        advanced += 25;
+      }
+      const res = await promise;
+      expect(res.status).toBe(503);
+      const ev = findEvent("webhook.rejected");
+      expect(ev?.reason).toBe("key_timeout");
+      expect(ev?.http_status).toBe(503);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("key_empty when the key resolves to an empty string", async () => {
+    const env = emptyKeySecrets();
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000302")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_empty");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("key_empty when the key resolves to a non-string value", async () => {
+    const env = nonStringKeySecrets();
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000303")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_empty");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("key_read_failed when secrets.get rejects with a promise", async () => {
+    const env = rejectingSecrets(validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000304")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_read_failed");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("key_read_failed when secrets.get throws synchronously", async () => {
+    const env = syncThrowingSecrets();
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000305")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json())).toEqual({ error: "service_unavailable" });
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("key_read_failed");
+    expect(ev?.http_status).toBe(503);
+    // The synchronous throw's message must not reach the log or the response.
+    const allLogs = JSON.stringify(logEvents());
+    expect(allLogs).not.toContain("sync boom");
+  });
+
+  it("verification_configuration_invalid when the stored key is malformed", async () => {
+    const env = invalidKeySecrets(validKv(VALID_CONFIG));
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000306")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    const ev = findEvent("webhook.rejected");
+    expect(ev?.reason).toBe("verification_configuration_invalid");
+    expect(ev?.http_status).toBe(503);
+  });
+
+  it("each diagnostic label appears as a fixed token — no key, body, or raw error leaks", async () => {
+    const cases: Array<{ name: string; reason: string; env: WebhookEnv; phone: string }> = [
+      {
+        name: "secrets_binding_missing",
+        reason: "secrets_binding_missing",
+        env: { CONFIG: validKv(VALID_CONFIG) },
+        phone: "+15550000310",
+      },
+      {
+        name: "key_empty",
+        reason: "key_empty",
+        env: emptyKeySecrets(),
+        phone: "+15550000311",
+      },
+      {
+        name: "key_read_failed (promise rejection)",
+        reason: "key_read_failed",
+        env: rejectingSecrets(validKv(VALID_CONFIG)),
+        phone: "+15550000312",
+      },
+      {
+        name: "key_read_failed (synchronous throw)",
+        reason: "key_read_failed",
+        env: syncThrowingSecrets(),
+        phone: "+15550000313",
+      },
+      {
+        name: "verification_configuration_invalid",
+        reason: "verification_configuration_invalid",
+        env: invalidKeySecrets(validKv(VALID_CONFIG)),
+        phone: "+15550000314",
+      },
+    ];
+    const validReasons = new Set([
+      "secrets_binding_missing",
+      "key_timeout",
+      "key_empty",
+      "key_read_failed",
+      "verification_configuration_invalid",
+    ]);
+    for (const c of cases) {
+      // Snapshot the rejection log before each iteration so we can identify
+      // the event produced by this specific request, regardless of what
+      // earlier tests in this loop (or in the file) already emitted.
+      const before = logEvents().filter(
+        (e) => e.event === "webhook.rejected",
+      ).length;
+      const res = await handler.fetch(
+        await webhookReq(initPayload(c.phone)),
+        c.env as never,
+      );
+      expect(res.status).toBe(503);
+      const after = logEvents().filter(
+        (e) => e.event === "webhook.rejected",
+      );
+      const emitted = after.slice(before);
+      expect(emitted, `case ${c.name}: emitted event`).toHaveLength(1);
+      expect(emitted[0]!.reason, `case ${c.name}: reason`).toBe(c.reason);
+      expect(validReasons.has(c.reason)).toBe(true);
+    }
+    const allLogs = JSON.stringify(logEvents());
+    // The phone sentinels are caller identifiers, not keys — masking would
+    // happen on the success path, but a 503 path must never log them either.
+    for (const c of cases) {
+      expect(allLogs, `phone ${c.phone} leaked`).not.toContain(c.phone);
+    }
+    // No underlying error message from the secret store reaches the log.
+    expect(allLogs).not.toContain("secret store down");
+    expect(allLogs).not.toContain("sync boom");
+    expect(allLogs).not.toContain("Error");
+    expect(allLogs).not.toContain("stack");
+    // No raw key bytes (the valid key is base64; the invalid one is too).
+    expect(allLogs).not.toContain(keyPair.publicKeyBase64);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Diagnostic timing — every call to loadWebhookKeyBounded must emit exactly
+// one webhook.key_lookup_completed event when the underlying secrets.get
+// operation settles (resolves or rejects), even if the 1000ms timeout has
+// already returned 503. The event carries only the settlement outcome
+// (ok / empty / read_failed), elapsed_ms, and after_timeout — never the key,
+// its length, headers, bodies, or raw errors.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — key lookup completion diagnostic", () => {
+  function completions(): Array<Record<string, unknown>> {
+    return logEvents().filter(
+      (e) => e.event === "webhook.key_lookup_completed",
+    );
+  }
+
+  function syncThrowingSecrets(): WebhookEnv {
+    const secrets: SecretsMock = {
+      get: vi.fn((binding: string) => {
+        if (binding === "WEBHOOK_PUBLIC_KEY") {
+          throw new Error("sync boom");
+        }
+        throw new Error(`unexpected binding: ${binding}`);
+      }),
+    };
+    return { CONFIG: validKv(VALID_CONFIG), SECRETS: secrets };
+  }
+
+  function captureUnhandled(): { list: unknown[]; off: () => void } {
+    const list: unknown[] = [];
+    const handler = (reason: unknown) => {
+      list.push(reason);
+    };
+    process.on("unhandledRejection", handler);
+    return {
+      list,
+      off: () => {
+        process.off("unhandledRejection", handler);
+      },
+    };
+  }
+
+  it("completes before timeout with outcome=ok and after_timeout=false", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const before = completions().length;
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000400")),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    const emitted = completions().slice(before);
+    expect(emitted).toHaveLength(1);
+    const ev = emitted[0]!;
+    expect(ev.outcome).toBe("ok");
+    expect(ev.after_timeout).toBe(false);
+    expect(typeof ev.elapsed_ms).toBe("number");
+    expect(ev.elapsed_ms as number).toBeGreaterThanOrEqual(0);
+    // The completion log must not leak the key, the request body, the
+    // caller, the headers, or any underlying error message.
+    const serialized = JSON.stringify(emitted);
+    expect(serialized).not.toContain(keyPair.publicKeyBase64);
+    expect(serialized).not.toContain("+15550000400");
+    expect(serialized).not.toContain("Error");
+    expect(serialized).not.toContain("stack");
+  });
+
+  it("completes after timeout with outcome=ok and after_timeout=true (late success)", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    try {
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const before = completions().length;
+      const promise = handler.fetch(
+        await webhookReq(initPayload("+15550000401")),
+        ps.env as never,
+      );
+      // Wait for the handler to settle with a 503 (timeout won the race).
+      let advanced = 0;
+      while (advanced < 5000) {
+        const settled = await Promise.race([
+          promise.then(() => true, () => true),
+          Promise.resolve(false),
+        ]);
+        if (settled) break;
+        await vi.advanceTimersByTimeAsync(25);
+        advanced += 25;
+      }
+      const res = await promise;
+      expect(res.status).toBe(503);
+      // No completion event yet — the key lookup is still pending.
+      expect(completions().slice(before)).toHaveLength(0);
+      // Late success: resolve the secret store after the timeout.
+      ps.resolve(keyPair.publicKeyBase64);
+      // Drain microtasks so the late .then() fires.
+      await new Promise<void>((r) => process.nextTick(r));
+      await new Promise<void>((r) => process.nextTick(r));
+      const emitted = completions().slice(before);
+      expect(emitted).toHaveLength(1);
+      const ev = emitted[0]!;
+      expect(ev.outcome).toBe("ok");
+      expect(ev.after_timeout).toBe(true);
+      expect(typeof ev.elapsed_ms).toBe("number");
+      expect(ev.elapsed_ms as number).toBeGreaterThanOrEqual(0);
+      const serialized = JSON.stringify(emitted);
+      expect(serialized).not.toContain(keyPair.publicKeyBase64);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records outcome=read_failed and after_timeout=true when the lookup rejects after timeout (no unhandled rejection)", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    const { list, off } = captureUnhandled();
+    try {
+      const ps = pendingSecrets(validKv(VALID_CONFIG));
+      const before = completions().length;
+      const promise = handler.fetch(
+        await webhookReq(initPayload("+15550000402")),
+        ps.env as never,
+      );
+      let advanced = 0;
+      while (advanced < 5000) {
+        const settled = await Promise.race([
+          promise.then(() => true, () => true),
+          Promise.resolve(false),
+        ]);
+        if (settled) break;
+        await vi.advanceTimersByTimeAsync(25);
+        advanced += 25;
+      }
+      const res = await promise;
+      expect(res.status).toBe(503);
+      // Late rejection: reject the secret store after the timeout.
+      ps.reject(new Error("late secret failure"));
+      await new Promise<void>((r) => process.nextTick(r));
+      await new Promise<void>((r) => process.nextTick(r));
+      const emitted = completions().slice(before);
+      expect(emitted).toHaveLength(1);
+      const ev = emitted[0]!;
+      expect(ev.outcome).toBe("read_failed");
+      expect(ev.after_timeout).toBe(true);
+      expect(typeof ev.elapsed_ms).toBe("number");
+      // The raw error message must not reach the log.
+      const serialized = JSON.stringify(emitted);
+      expect(serialized).not.toContain("late secret failure");
+      expect(serialized).not.toContain("Error");
+      expect(serialized).not.toContain("stack");
+      // And no unhandled rejection escapes from the late settle.
+      expect(list).toEqual([]);
+    } finally {
+      off();
+      vi.useRealTimers();
+    }
+  });
+
+  it("records outcome=read_failed and after_timeout=false when secrets.get throws synchronously", async () => {
+    const env = syncThrowingSecrets();
+    const before = completions().length;
+    const res = await handler.fetch(
+      await webhookReq(initPayload("+15550000403")),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json())).toEqual({ error: "service_unavailable" });
+    const emitted = completions().slice(before);
+    expect(emitted).toHaveLength(1);
+    const ev = emitted[0]!;
+    expect(ev.outcome).toBe("read_failed");
+    expect(ev.after_timeout).toBe(false);
+    expect(typeof ev.elapsed_ms).toBe("number");
+    // The raw synchronous throw message must not reach the log.
+    const serialized = JSON.stringify(emitted);
+    expect(serialized).not.toContain("sync boom");
+    expect(serialized).not.toContain("Error");
+    expect(serialized).not.toContain("stack");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WEBHOOK_PUBLIC_KEY cache — the bound lookup is the dominant cost on the
+// warm assistant-init path (≈700ms per request in production telemetry),
+// and Telnyx only gives the whole webhook a 1500ms budget. A successful
+// read is immutable for the lifetime of the instance, so we cache it
+// module-level and short-circuit subsequent lookups. Failures are never
+// cached: a slow or empty read on one request must be retried on the next.
+// ---------------------------------------------------------------------------
+
+describe("/webhooks/dynamic-variables — WEBHOOK_PUBLIC_KEY cache", () => {
+  it("second request serves from cache; SECRETS.get is not called again", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res1 = await handler.fetch(
+      await webhookReq(initPayload("+15550000500")),
+      env as never,
+    );
+    expect(res1.status).toBe(200);
+    expect(env.SECRETS!.get).toHaveBeenCalledTimes(1);
+
+    const res2 = await handler.fetch(
+      await webhookReq(initPayload("+15550000501")),
+      env as never,
+    );
+    expect(res2.status).toBe(200);
+    // The warm path short-circuits the bounded lookup, so the secret store
+    // is not consulted a second time on the same env.
+    expect(env.SECRETS!.get).toHaveBeenCalledTimes(1);
+
+    // The cache-hit completion is recorded with cached=true so the
+    // diagnostic stream keeps showing that the warm path is engaged.
+    const cached = logEvents().filter(
+      (e) => e.event === "webhook.key_lookup_completed" && e.cached === true,
+    );
+    expect(cached).toHaveLength(1);
+    expect(cached[0]!.outcome).toBe("ok");
+    expect(cached[0]!.after_timeout).toBe(false);
+    expect(typeof cached[0]!.elapsed_ms).toBe("number");
+    // And the cached completion must never carry the key value.
+    expect(JSON.stringify(cached)).not.toContain(keyPair.publicKeyBase64);
+  });
+
+  it("failed lookup is not cached; a subsequent valid lookup retries SECRETS.get", async () => {
+    // First request: secrets.get rejects with a promise → key_read_failed,
+    // 503, and the module-level cache stays empty by design.
+    const failing = rejectingSecrets(validKv(VALID_CONFIG));
+    const res1 = await handler.fetch(
+      await webhookReq(initPayload("+15550000502")),
+      failing as never,
+    );
+    expect(res1.status).toBe(503);
+    expect(failing.SECRETS!.get).toHaveBeenCalledTimes(1);
+
+    // Second request: a different env whose SECRETS returns the valid key.
+    // Because the first failure did not populate the cache, the handler
+    // must call SECRETS.get on the new env and succeed.
+    const valid = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res2 = await handler.fetch(
+      await webhookReq(initPayload("+15550000503")),
+      valid as never,
+    );
+    expect(res2.status).toBe(200);
+    expect(valid.SECRETS!.get).toHaveBeenCalledTimes(1);
+
+    // The first failure emitted cached=false (a real lookup that read
+    // nothing useful) and the second emitted cached=false too (another
+    // real lookup that read the key). No cached=true should be present
+    // because the cache stayed empty through the failure.
+    const cachedHits = logEvents().filter(
+      (e) => e.event === "webhook.key_lookup_completed" && e.cached === true,
+    );
+    expect(cachedHits).toHaveLength(0);
+  });
+
+  it("empty key is not cached; a subsequent valid lookup retries SECRETS.get", async () => {
+    const empty: WebhookEnv = {
+      CONFIG: validKv(VALID_CONFIG),
+      SECRETS: {
+        get: vi.fn(async (binding: string) => {
+          if (binding === "WEBHOOK_PUBLIC_KEY") return "";
+          throw new Error(`unexpected binding: ${binding}`);
+        }),
+      },
+    };
+    const res1 = await handler.fetch(
+      await webhookReq(initPayload("+15550000504")),
+      empty as never,
+    );
+    expect(res1.status).toBe(503);
+    expect(empty.SECRETS!.get).toHaveBeenCalledTimes(1);
+
+    const valid = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const res2 = await handler.fetch(
+      await webhookReq(initPayload("+15550000505")),
+      valid as never,
+    );
+    expect(res2.status).toBe(200);
+    expect(valid.SECRETS!.get).toHaveBeenCalledTimes(1);
   });
 });

@@ -64,7 +64,7 @@ const CONFIG_WAIT_MS = 800;
 // secret store is normally warm, but a hung lookup must not stall the
 // assistant-init path — verifyWebhookSignature needs the key, and the
 // webhook cannot answer the call without it.
-const WEBHOOK_KEY_WAIT_MS = 200;
+const WEBHOOK_KEY_WAIT_MS = 1000;
 
 // Race loadConfig against a fixed deadline so the webhook cannot hang on a
 // slow KV. A late resolution is discarded; a late rejection is caught so it
@@ -84,25 +84,133 @@ async function loadConfigBounded(
   return outcome;
 }
 
-// Race the secrets read for the Ed25519 verification key against a fixed
-// deadline. Mirrors loadConfigBounded: a late resolution is discarded, a
-// late rejection is converted to ok:false so it cannot escape as an
-// unhandled rejection. The setTimeout handle is always cleared once the race
-// settles, so the timer does not outlive the request.
+// Module-level cache for a successfully read WEBHOOK_PUBLIC_KEY. The bound
+// lookup normally lands in 700+ms on a warm instance (production telemetry),
+// which is half of the 1500ms budget Telnyx gives the whole webhook. A
+// successful read is immutable for the lifetime of the instance, so we
+// short-circuit subsequent requests with this cache and only ever reach
+// SECRETS once per instance. Failures are deliberately not cached: a slow
+// or empty read on one request must be retried on the next.
+let cachedWebhookKey: string | null = null;
+
+// Test-only escape hatch so suites that drive the handler directly can
+// observe the first-lookup semantics in isolation. Production code never
+// calls this — the cache is invalidated by an instance restart, which is
+// the right time to re-read a binding that may have rotated.
+export function __resetWebhookKeyCacheForTests(): void {
+  cachedWebhookKey = null;
+}
+
+// Race the secrets read for the Ed25519 verification key against the fixed
+// 1000ms deadline. A late resolution is discarded; a late rejection is
+// captured by the .then(_, onRejected) pair so it never escapes as an
+// unhandled rejection. The setTimeout handle is cleared once the race
+// settles so the timer does not outlive the request. A synchronous throw
+// from secrets.get (e.g. an unwired binding) is caught by the surrounding
+// try and reported as key_read_failed. The three failure modes are
+// reported with distinct, structured reasons so an operator can distinguish
+// a slow lookup (key_timeout), an empty or non-string value (key_empty), and
+// a rejected promise or synchronous throw (key_read_failed) from runtime
+// logs without learning anything about the key value itself.
+//
+// Diagnostic timing: when the underlying secrets.get operation eventually
+// settles — even if the 1000ms timeout has already returned 503 — exactly one
+// webhook.key_lookup_completed event is emitted with outcome (ok / empty /
+// read_failed), elapsed_ms from the lookup start, after_timeout, and cached.
+// A cache hit emits the event with outcome=ok, elapsed_ms≈0, cached=true
+// so the warm-path latency stays visible in the same diagnostic stream.
+// The log never carries the key, its length, headers, bodies, or raw errors;
+// it only records that the lookup settled and how long it took.
 async function loadWebhookKeyBounded(
   secrets: Secrets,
-): Promise<{ ok: true; key: string } | { ok: false }> {
+): Promise<
+  | { ok: true; key: string }
+  | { ok: false; reason: "key_timeout" | "key_empty" | "key_read_failed" }
+> {
+  // Cache hit: short-circuit the bounded lookup so a warm instance never
+  // pays the production-observed ~700ms cost on the assistant-init path.
+  // We still emit the completion event so the diagnostic stream keeps
+  // showing that the warm path is engaged.
+  if (cachedWebhookKey !== null) {
+    logEvent("webhook.key_lookup_completed", {
+      outcome: "ok",
+      elapsed_ms: 0,
+      after_timeout: false,
+      cached: true,
+    });
+    return { ok: true, key: cachedWebhookKey };
+  }
+
+  const startMs = Date.now();
+  let timedOut = false;
+
+  const emitCompletion = (
+    outcome: "ok" | "empty" | "read_failed",
+    afterTimeout: boolean,
+  ): void => {
+    logEvent("webhook.key_lookup_completed", {
+      outcome,
+      elapsed_ms: Date.now() - startMs,
+      after_timeout: afterTimeout,
+      cached: false,
+    });
+  };
+
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const keyPromise = secrets.get("WEBHOOK_PUBLIC_KEY").then(
-    (key): { ok: true; key: string } | { ok: false } =>
-      typeof key === "string" && key.length > 0
-        ? { ok: true, key }
-        : { ok: false },
-    (): { ok: false } => ({ ok: false }),
-  );
-  const timeoutPromise = new Promise<{ ok: false }>((resolve) => {
-    timer = setTimeout(() => resolve({ ok: false }), WEBHOOK_KEY_WAIT_MS);
+  let keyPromise: Promise<
+    | { ok: true; key: string }
+    | { ok: false; reason: "key_empty" | "key_read_failed" }
+  >;
+  try {
+    const raw = secrets.get("WEBHOOK_PUBLIC_KEY");
+    keyPromise = Promise.resolve(raw).then(
+      (key): { ok: true; key: string } | { ok: false; reason: "key_empty" } =>
+        typeof key === "string" && key.length > 0
+          ? { ok: true, key }
+          : { ok: false, reason: "key_empty" },
+      (): { ok: false; reason: "key_read_failed" } => ({
+        ok: false,
+        reason: "key_read_failed",
+      }),
+    );
+  } catch {
+    // Synchronous throw from secrets.get — there is no keyPromise to observe,
+    // so the completion event is emitted inline. A sync throw means we
+    // never had a key in hand, so nothing is cached here either.
+    emitCompletion("read_failed", false);
+    return { ok: false, reason: "key_read_failed" };
+  }
+
+  // Observe keyPromise so a late settle still produces the diagnostic event
+  // even if the timeout has already returned 503. keyPromise never rejects
+  // (both .then handlers are provided), so no .catch() fallback is needed
+  // and no unhandled rejection can escape from this attachment. Only a
+  // real, non-empty key is cached: empty values, late rejections, and the
+  // timeout path leave the cache empty so the next request retries.
+  keyPromise.then((result) => {
+    let outcome: "ok" | "empty" | "read_failed";
+    if (result.ok) {
+      outcome = "ok";
+      cachedWebhookKey = result.key;
+    } else if (result.reason === "key_empty") {
+      outcome = "empty";
+    } else {
+      outcome = "read_failed";
+    }
+    emitCompletion(outcome, timedOut);
   });
+
+  const timeoutPromise = new Promise<{ ok: false; reason: "key_timeout" }>(
+    (resolve) => {
+      timer = setTimeout(
+        () => {
+          timedOut = true;
+          resolve({ ok: false, reason: "key_timeout" });
+        },
+        WEBHOOK_KEY_WAIT_MS,
+      );
+    },
+  );
   const outcome = await Promise.race([keyPromise, timeoutPromise]);
   if (timer !== undefined) clearTimeout(timer);
   return outcome;
@@ -155,12 +263,14 @@ export async function handleDynamicVariables(
   }
 
   // Verify the delivery before parsing or touching KV. The key read is
-  // bounded (200ms) so a slow secrets backend cannot stall the assistant
-  // init path; any failure — missing binding, empty value, late or rejected
-  // promise — collapses to a generic 503, with no leaked detail.
+  // bounded (1000ms) so a slow secrets backend cannot stall the assistant
+  // init path; every failure mode — missing binding, empty value, late or
+  // rejected promise, synchronous throw — collapses to a generic 503, with
+  // no leaked detail. The diagnostic reason on the log line is the only
+  // way to tell them apart.
   if (env.SECRETS === undefined) {
     logEvent("webhook.rejected", {
-      reason: "key_unavailable",
+      reason: "secrets_binding_missing",
       http_status: 503,
       latency_ms: Date.now() - start,
     });
@@ -169,7 +279,7 @@ export async function handleDynamicVariables(
   const keyResult = await loadWebhookKeyBounded(env.SECRETS);
   if (!keyResult.ok) {
     logEvent("webhook.rejected", {
-      reason: "key_unavailable",
+      reason: keyResult.reason,
       http_status: 503,
       latency_ms: Date.now() - start,
     });
@@ -187,7 +297,7 @@ export async function handleDynamicVariables(
     // a slow secrets lookup would, so an operator can fix the binding
     // without distinguishing the two cases by status code.
     logEvent("webhook.rejected", {
-      reason: "key_unavailable",
+      reason: "verification_configuration_invalid",
       http_status: 503,
       latency_ms: Date.now() - start,
     });

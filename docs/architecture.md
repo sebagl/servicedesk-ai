@@ -17,7 +17,7 @@ points today.
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` (and `/health/liveness`, `/health/readiness`) | none | Liveness probe; does not prove KV or Actor reachability |
-| `POST /webhooks/dynamic-variables` | none (signature verification pending) | Telnyx Assistant init webhook |
+| `POST /webhooks/dynamic-variables` | Ed25519 signature on `telnyx-signature-ed25519` + `telnyx-timestamp` (`WEBHOOK_PUBLIC_KEY`) | Telnyx Assistant init webhook |
 | `POST /mcp` | `MCP_AUTH` bearer (`MCP_API_TOKEN`) | MCP server, stateless streamable HTTP. Browser `Origin` → 404 |
 | `GET /demo/config` | `SMOKE_AUTH` bearer (`SMOKE_TEST_TOKEN`) | Returns validated KV config |
 | `GET /demo/availability?date=YYYY-MM-DD` | `SMOKE_AUTH` | Slots for one date with Actor occupancy |
@@ -36,7 +36,11 @@ Failure modes (intentionally distinct across surfaces):
   tool result text is `service_unavailable` or the domain error code).
 - `/webhooks/dynamic-variables` KV wait timeout / load failure / absent
   binding → HTTP `200` with `system_status: "degraded"` and
-  `booking_enabled: "false"` (never blocks the caller).
+  `booking_enabled: "false"` (never blocks the caller). Signature-verification
+  failure modes: missing / malformed `WEBHOOK_PUBLIC_KEY`, slow (>1000 ms)
+  secret lookup, or `crypto.subtle` reject → HTTP `503
+  { error: "service_unavailable" }`; missing / malformed / out-of-window /
+  unverified signature → HTTP `401 { error: "unauthorized" }`.
 
 No raw error messages are returned on any surface. No customer names or full
 phone numbers are logged or returned in any response on any route; the
@@ -73,6 +77,25 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
 (`booking_enabled`, `system_status`, `today_local`, `today_weekday`,
 `now_local_time`, `business_hours`, `service_list`).
 
+- **Ed25519 signature verification.** Every delivery is verified before the
+  JSON body is parsed or KV is touched. `verifyWebhookSignature()`
+  (`src/webhook-signature.ts`) is a pure function: given the raw body, the
+  request headers, the base64 public key, and `Date.now()`, it returns
+  `valid` / `invalid_signature` / `invalid_configuration`. The signed payload
+  is `${timestampHeader}|${rawBody}` and the timestamp is checked against a
+  ±300 s window. A throw from `crypto.subtle` (Ed25519 unavailable, bytes not
+  a valid Ed25519 point) collapses to `invalid_configuration` rather than a
+  misleading `invalid_signature`. **Fail-closed:**
+  - `WEBHOOK_PUBLIC_KEY` missing, empty, slow (>1000 ms), malformed, or
+    `crypto.subtle` rejection → HTTP `503 { error: "service_unavailable" }`.
+  - Missing / out-of-window timestamp header, missing / wrong-length
+    signature header, or a signature that does not verify → HTTP
+    `401 { error: "unauthorized" }`.
+- **1000 ms bounded secrets wait.** `loadWebhookKeyBounded` races the
+  `secrets.get("WEBHOOK_PUBLIC_KEY")` lookup against a fixed
+  `WEBHOOK_KEY_WAIT_MS = 1000` deadline so a slow secrets backend cannot stall
+  the assistant-init path; the late-resolution / late-rejection semantics
+  mirror `loadConfigBounded`.
 - **800 ms bounded KV wait.** `loadConfigBounded` races `loadConfig(kv)`
   against a fixed `CONFIG_WAIT_MS = 800` deadline; a late rejection is
   swallowed so it cannot escape as an unhandled promise rejection.
@@ -83,8 +106,8 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
   latency_ms) on early rejections; `webhook.dynamic_variables` on success
   with masked caller phone (`***NNNN`), call_control_id, assistant_id,
   system_status, booking_enabled, config_outcome, latency_ms. No customer
-  names or full phone numbers are logged; raw request bodies are never
-  logged.
+  names or full phone numbers are logged; raw request bodies, header
+  values, and unvalidated identifiers are never logged.
 
 ## Adapters and the booking-service
 
@@ -160,21 +183,25 @@ configuration. The demo seed lives in `config/main.json` (non-sensitive).
 
 ## Secret bindings (`telnyx.toml`)
 
-Two independent `[[secrets]]` entries so revocation scopes to one surface:
+Three independent `[[secrets]]` entries so revocation scopes to one surface:
 
 - `SMOKE_AUTH → SMOKE_TEST_TOKEN` — `Authorization: Bearer <value>` gate on
   every `/demo/*` route.
 - `MCP_AUTH → MCP_API_TOKEN` — `Authorization: Bearer <value>` gate on
   `/mcp`, plus a `404` on browser-originated requests (`Origin` header).
+- `WEBHOOK_PUBLIC_KEY → TELNYX_PUBLIC_KEY` — base64 32-byte Ed25519 public
+  key used by `verifyWebhookSignature` to authenticate deliveries to
+  `/webhooks/dynamic-variables`. The matching private key lives in Mission
+  Control; this repo never sees it.
 
-Token values are never committed, logged, or echoed in any response.
+Token and key values are never committed, logged, or echoed in any response.
 Authenticates before any KV read or Actor call; rejected requests never
 reach infrastructure.
 
 ## What's verified vs. what isn't
 
 **Verified — local mocked tests** (`npm run typecheck` 0 errors, `npm test`
-377/377 passing):
+510/510 passing across 14 files):
 
 - HTTP routing, method handling, and 404 behavior for every route.
 - Full auth gate: absent/empty/rejecting secret → `503`; missing/malformed/
@@ -225,21 +252,24 @@ reach infrastructure.
 **Local changes after the recorded evidence are not claimed deployed.** The
 dynamic-variables webhook extraction **and** the `ConversationBooking` Actor
 routing post-date the 2026-10-16 ship that produced the recorded public URL;
-re-run `telnyx-edge ship` before relying on them remotely. The
-`/demo/*` route set and the read-side MCP tools (`get_service_catalog`,
-`get_availability`) are part of the recorded evidence.
+subtask 5.x in `docs/verification.md` records the 2026-10-17 ship that
+deployed them, but it does not claim real cross-Actor execution or verified
+Telnyx signatures — only the unauthenticated boundary checks performed
+against the live URL. The `/demo/*` route set and the read-side MCP tools
+(`get_service_catalog`, `get_availability`) are part of the recorded
+evidence.
 
 **Local `dev` does not emulate `[[secrets]]` or `[storage.kv]`.** Auth-gated
-demo routes and `/mcp` return `503` locally. The dynamic-variables webhook is
-unaffected — it answers `200 degraded` when `CONFIG` is absent, which is the
-expected local-dev behaviour and is exercised by the mocked suite. Recorded
-local runtime evidence in subtasks 1.2/1.3 ran before the auth gate was added
-and is preserved as historical platform-probe evidence only.
+demo routes and `/mcp` return `503` locally. The dynamic-variables webhook
+fails closed at the `WEBHOOK_PUBLIC_KEY` lookup in local `dev` and answers
+`503 { error: "service_unavailable" }` (the key is not bound locally), which
+is the expected fail-closed path; the mocked suite exercises the rest of the
+handler (`CONFIG` wait, JSON parse, payload envelope, structured logs)
+independently. Recorded local runtime evidence in subtasks 1.2/1.3 ran
+before the auth gate was added and is preserved as historical platform-probe
+evidence only.
 
 ## Pending (planned, not implemented)
 
 - Voice AI Assistant / Conversation Workflow / phone-number integration.
-- Webhook signature verification on `/webhooks/dynamic-variables`
-  (authenticity, monitoring, and the workflow task remain pending and
-  unchanged in scope).
 - Monitoring, alerts, and an operations portal.
