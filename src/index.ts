@@ -1,9 +1,11 @@
 export { Counter } from "./counter";
 export { DayAgenda } from "./agenda-actor";
 export { ConversationBooking } from "./conversation-actor";
+export { CallbackQueue } from "./callback-queue-actor";
 import type { Counter } from "./counter";
 import type { AgendaNamespace } from "./agenda-binding";
 import type { ConversationBooking as ConversationBookingActor } from "./conversation-actor";
+import type { CallbackQueueNamespace } from "./callback-binding";
 
 import {
   type ActorNamespace,
@@ -34,6 +36,7 @@ interface Env {
   COUNTER: CounterNamespace;
   AGENDA: AgendaNamespace;
   CONVERSATION_BOOKING: ConversationBookingNamespace;
+  CALLBACK_QUEUE: CallbackQueueNamespace;
   SECRETS?: Secrets;
   CONFIG?: KvNamespace;
 }
@@ -147,6 +150,7 @@ export default {
         config: env.CONFIG,
         agenda: env.AGENDA,
         conversationBooking: env.CONVERSATION_BOOKING,
+        callbackQueue: env.CALLBACK_QUEUE,
         callId: readCallId(req),
       });
     }
@@ -155,11 +159,18 @@ export default {
     const isDemoConfig = url.pathname === "/demo/config";
     const isDemoAvailability = url.pathname === "/demo/availability";
     const isDemoBookings = url.pathname === "/demo/bookings";
+    const isDemoCallbacks = url.pathname === "/demo/callbacks";
     const counterMatch = url.pathname.match(
       /^\/demo\/counter\/([^/]+)\/(increment|read)$/,
     );
 
-    if (!isDemoConfig && !isDemoAvailability && !isDemoBookings && !counterMatch) {
+    if (
+      !isDemoConfig &&
+      !isDemoAvailability &&
+      !isDemoBookings &&
+      !isDemoCallbacks &&
+      !counterMatch
+    ) {
       return new Response("not found", { status: 404 });
     }
 
@@ -235,6 +246,43 @@ export default {
       }
       const result = await handleBookingRequest(req, env);
       return Response.json(result.body, { status: result.status });
+    }
+
+    // --- GET /demo/callbacks — operator view of pending callback requests.
+    // Behind the same SMOKE_AUTH bearer gate as the other /demo routes.
+    // 405 on wrong method, 503 when the binding is missing or the Actor
+    // throws. Never logs entry contents — only count and latency.
+    if (isDemoCallbacks) {
+      if (req.method !== "GET") {
+        return new Response(
+          JSON.stringify({ error: "method_not_allowed" }),
+          { status: 405, headers: { "content-type": "application/json" } },
+        );
+      }
+      const start = Date.now();
+      if (!env.CALLBACK_QUEUE) {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+      let entries;
+      try {
+        const stub = env.CALLBACK_QUEUE.idFromName("main");
+        entries = await stub.listCallbacks();
+      } catch {
+        return Response.json({ error: "service_unavailable" }, { status: 503 });
+      }
+      logEvent("callback.listed", {
+        count: entries.length,
+        latency_ms: Date.now() - start,
+      });
+      return Response.json({
+        callbacks: entries.map((e) => ({
+          id: e.id,
+          created_at: e.created_at,
+          customer_name: e.customer_name,
+          customer_phone: e.customer_phone,
+          reason: e.reason,
+        })),
+      });
     }
 
     // --- /demo/counter/:id/{increment,read} ---

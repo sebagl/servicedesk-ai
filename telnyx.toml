@@ -25,6 +25,13 @@ type    = "DayAgenda"
 binding = "CONVERSATION_BOOKING"
 type    = "ConversationBooking"
 
+# Callback Queue — single shared instance ("main") holding the newest 200
+# callback requests. Per-conversation idempotency: the first request wins,
+# subsequent requests for the same conversation return the original entry.
+[[actors]]
+binding = "CALLBACK_QUEUE"
+type    = "CallbackQueue"
+
 # KV namespace for service catalog + business configuration.
 # Created via `telnyx-edge storage kv create --name servicedesk-ai-config`.
 # Not available in local `dev` — config loader fails closed (503) without it.

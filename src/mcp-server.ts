@@ -17,7 +17,8 @@ import { isValidDate } from "./scheduling";
 import type { AgendaNamespace } from "./agenda-binding";
 import type { ConversationBooking as ConversationBookingActor } from "./conversation-actor";
 import type { ConversationBookingResult } from "./conversation-booking";
-import { logEvent } from "./logger";
+import type { CallbackQueueNamespace } from "./callback-binding";
+import { logEvent, maskPhone } from "./logger";
 
 const SERVICE_INFO = { name: "servicedesk-ai", version: "0.0.0" } as const;
 
@@ -41,6 +42,14 @@ const CREATE_BOOKING_INPUT = z
     customer_name: z.string().trim().min(1).max(256),
     customer_phone: z.string().trim().min(1).max(64),
     confirmed: z.boolean(),
+  })
+  .strict();
+
+const REQUEST_CALLBACK_INPUT = z
+  .object({
+    customer_name: z.string().trim().min(1).max(256),
+    customer_phone: z.string().trim().min(1).max(64),
+    reason: z.string().trim().min(1).max(500),
   })
   .strict();
 
@@ -489,10 +498,126 @@ function registerCreateBooking(
   );
 }
 
+// Single shared instance — there is only one callback queue across all
+// conversations. Routing all callers to the same Actor name guarantees a
+// single coherent read-modify-write of the "queue" key.
+const CALLBACK_QUEUE_ACTOR_NAME = "main";
+
+// `request_callback` — write path. Records a callback request for the team
+// against the trusted Telnyx conversation id. Conversation identity is
+// required (read from SDK metadata only) and routes the call to a single
+// shared CallbackQueue StatefulActor that owns the persisted queue and
+// per-conversation idempotency. The Actor returns only an opaque
+// request_id and the originating created_at — customer name and phone
+// are accepted on the wire, persisted inside the Actor, but never echoed
+// back in the MCP response. Tool-handler failures never throw out —
+// missing metadata, absent binding, RPC failures, and malformed Actor
+// results all collapse to a generic MCP tool error.
+function registerRequestCallback(
+  server: McpServer,
+  callbackQueue: CallbackQueueNamespace | undefined,
+  callId: string,
+): void {
+  server.registerTool(
+    "request_callback",
+    {
+      description:
+        "Record a callback request for the team. Call once, after the caller gives their name and a short reason. Only tell the caller the request is recorded if status is recorded.",
+      inputSchema: REQUEST_CALLBACK_INPUT,
+    },
+    async (
+      args: { customer_name: string; customer_phone: string; reason: string },
+      extra,
+    ) => {
+      const start = Date.now();
+      const conversationId = readConversationId(extra);
+
+      if (conversationId === undefined) {
+        return logToolResult(
+          "request_callback",
+          callId,
+          start,
+          toolError("conversation_id_required"),
+          conversationId,
+        );
+      }
+
+      if (callbackQueue === undefined) {
+        return logToolResult(
+          "request_callback",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
+      }
+
+      let raw: { request_id?: unknown; created_at?: unknown };
+      try {
+        const stub = callbackQueue.idFromName(CALLBACK_QUEUE_ACTOR_NAME);
+        raw = await stub.requestCallback({
+          conversation_id: conversationId,
+          customer_name: args.customer_name,
+          customer_phone: args.customer_phone,
+          reason: args.reason,
+        });
+      } catch {
+        return logToolResult(
+          "request_callback",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
+      }
+
+      if (
+        typeof raw?.request_id !== "string" ||
+        raw.request_id.length === 0 ||
+        typeof raw.created_at !== "string"
+      ) {
+        return logToolResult(
+          "request_callback",
+          callId,
+          start,
+          toolError(),
+          conversationId,
+        );
+      }
+
+      const requestId = raw.request_id;
+      const latencyMs = Date.now() - start;
+
+      logEvent("callback.requested", {
+        request_id: requestId,
+        telnyx_conversation_id: conversationId,
+        phone_masked: maskPhone(args.customer_phone),
+        latency_ms: latencyMs,
+      });
+
+      return logToolResult(
+        "request_callback",
+        callId,
+        start,
+        {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ status: "recorded", request_id: requestId }),
+            },
+          ],
+        },
+        conversationId,
+      );
+    },
+  );
+}
+
 export interface McpDeps {
   config?: KvNamespace;
   agenda?: AgendaNamespace;
   conversationBooking?: ConversationBookingNamespace;
+  callbackQueue?: CallbackQueueNamespace;
   // Optional caller-supplied correlation id (e.g. the Telnyx call_control_id
   // forwarded as a header), logged so a call can be traced across webhook
   // and tool calls. Never used for authorization or business logic.
@@ -515,6 +640,7 @@ export async function handleMcpRequest(
   registerGetServiceCatalog(server, deps.config, deps.callId ?? "");
   registerGetAvailability(server, deps.config, deps.agenda, deps.callId ?? "");
   registerCreateBooking(server, deps.conversationBooking, deps.callId ?? "");
+  registerRequestCallback(server, deps.callbackQueue, deps.callId ?? "");
 
   try {
     await server.connect(transport);

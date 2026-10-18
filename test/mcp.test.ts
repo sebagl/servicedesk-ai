@@ -13,6 +13,10 @@ import type {
   ConversationBookingInput,
   ConversationBookingResult,
 } from "../src/conversation-booking";
+import type {
+  CallbackRequestInput,
+  CallbackRequestResult,
+} from "../src/callback-queue-actor";
 
 const VALID_TOKEN = "mcp-test-token-value";
 
@@ -275,6 +279,7 @@ describe("/mcp — tools/list", () => {
       "get_service_catalog",
       "get_availability",
       "create_booking",
+      "request_callback",
     ]);
   });
 });
@@ -1882,5 +1887,421 @@ describe("/mcp — MCP_AUTH cache", () => {
     );
     expect(res2.status).toBe(200);
     expect(validSecrets2.get).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// request_callback — single shared CallbackQueue StatefulActor
+// ---------------------------------------------------------------------------
+
+describe("/mcp — tools/call request_callback", () => {
+  type CallbackHandler = (
+    input: CallbackRequestInput,
+  ) =>
+    | CallbackRequestResult
+    | Error
+    | Promise<CallbackRequestResult | Error>;
+
+  function callbackQueueStub(handler: CallbackHandler) {
+    const stub = {
+      requestCallback: vi.fn(async (input: CallbackRequestInput) => {
+        const result = await handler(input);
+        if (result instanceof Error) throw result;
+        return result;
+      }),
+    };
+    return {
+      stub,
+      idFromName: vi.fn(() => stub),
+    };
+  }
+
+  const CALLBACK_ARGS = () => ({
+    customer_name: "Alice Smith",
+    customer_phone: "+5215512345678",
+    reason: "question about oil change pricing",
+  });
+
+  function callRequestCallback(
+    env: unknown,
+    id: number,
+    arguments_: unknown,
+    meta: unknown = undefined,
+  ): Promise<Response> {
+    const params: Record<string, unknown> = {
+      name: "request_callback",
+      arguments: arguments_,
+    };
+    if (meta !== undefined) params._meta = meta;
+    return handler.fetch(
+      mcpRequest(jsonRpcBody(id, "tools/call", params), mcpHeaders(VALID_TOKEN)),
+      env as never,
+    );
+  }
+
+  it("valid metadata → records a callback and returns status + request_id only", async () => {
+    const captured: CallbackRequestInput[] = [];
+    const { stub, idFromName } = callbackQueueStub((input) => {
+      captured.push(input);
+      return {
+        request_id: "req-1",
+        created_at: "2026-10-18T10:00:00.000Z",
+      };
+    });
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-cb-1" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        isError?: boolean;
+        content: Array<{ type: string; text: string }>;
+      };
+    };
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content).toHaveLength(1);
+    const parsed = JSON.parse(body.result.content[0]!.text) as {
+      status: string;
+      request_id: string;
+    };
+    expect(parsed).toEqual({ status: "recorded", request_id: "req-1" });
+
+    expect(idFromName).toHaveBeenCalledTimes(1);
+    expect(idFromName).toHaveBeenCalledWith("main");
+    expect(stub.requestCallback).toHaveBeenCalledTimes(1);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.conversation_id).toBe("conv-cb-1");
+    expect(captured[0]!.customer_name).toBe("Alice Smith");
+    expect(captured[0]!.customer_phone).toBe("+5215512345678");
+    expect(captured[0]!.reason).toBe("question about oil change pricing");
+  });
+
+  it("idempotent repeat in the same conversation returns the same request_id", async () => {
+    const seen = new Map<string, string>();
+    let n = 0;
+    const stub = {
+      requestCallback: vi.fn(async (input: CallbackRequestInput) => {
+        const existing = seen.get(input.conversation_id);
+        if (existing !== undefined) {
+          return { request_id: existing, created_at: "2026-10-18T10:00:00.000Z" };
+        }
+        n += 1;
+        const id = `req-${n}`;
+        seen.set(input.conversation_id, id);
+        return { request_id: id, created_at: "2026-10-18T10:00:00.000Z" };
+      }),
+    };
+    const idFromName = vi.fn(() => stub);
+    const env = { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } };
+
+    const r1 = await callRequestCallback(
+      env,
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-cb-replay" },
+    );
+    const r2 = await callRequestCallback(
+      env,
+      2,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-cb-replay" },
+    );
+
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    const b1 = (await r1.json()) as {
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    const b2 = (await r2.json()) as {
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    const p1 = JSON.parse(b1.result.content[0]!.text) as { request_id: string };
+    const p2 = JSON.parse(b2.result.content[0]!.text) as { request_id: string };
+    expect(p2.request_id).toBe(p1.request_id);
+    expect(stub.requestCallback).toHaveBeenCalledTimes(2);
+  });
+
+  it("different conversations get independent request_ids", async () => {
+    let n = 0;
+    const stub = {
+      requestCallback: vi.fn(async (_input: CallbackRequestInput) => {
+        n += 1;
+        return { request_id: `req-${n}`, created_at: "2026-10-18T10:00:00.000Z" };
+      }),
+    };
+    const idFromName = vi.fn(() => stub);
+    const env = { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } };
+
+    const r1 = await callRequestCallback(
+      env,
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-alpha" },
+    );
+    const r2 = await callRequestCallback(
+      env,
+      2,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-beta" },
+    );
+
+    const b1 = (await r1.json()) as {
+      result: { content: Array<{ text: string }> };
+    };
+    const b2 = (await r2.json()) as {
+      result: { content: Array<{ text: string }> };
+    };
+    const p1 = JSON.parse(b1.result.content[0]!.text) as { request_id: string };
+    const p2 = JSON.parse(b2.result.content[0]!.text) as { request_id: string };
+    expect(p1.request_id).not.toBe(p2.request_id);
+  });
+
+  it("missing conversation metadata → conversation_id_required, no actor call", async () => {
+    const { stub, idFromName } = callbackQueueStub(() => ({
+      request_id: "req-1",
+      created_at: "2026-10-18T10:00:00.000Z",
+    }));
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      CALLBACK_ARGS(),
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "conversation_id_required" }),
+    );
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(stub.requestCallback).not.toHaveBeenCalled();
+  });
+
+  it("invalid conversation metadata (bad charset) → conversation_id_required", async () => {
+    const { stub, idFromName } = callbackQueueStub(() => ({
+      request_id: "req-1",
+      created_at: "2026-10-18T10:00:00.000Z",
+    }));
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "has space and !chars" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe(
+      JSON.stringify({ error: "conversation_id_required" }),
+    );
+    expect(stub.requestCallback).not.toHaveBeenCalled();
+  });
+
+  it("absent CALLBACK_QUEUE binding → service_unavailable, no infra call", async () => {
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets() },
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-cb-nobinding" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+
+  it("actor throws → service_unavailable, raw error never leaked", async () => {
+    const SENTINEL = `__cb_sentinel_${Date.now()}__`;
+    const { idFromName } = callbackQueueStub(() => {
+      throw new Error(`rpc failure: ${SENTINEL}`);
+    });
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-cb-throw" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+    expect(JSON.stringify(body)).not.toContain(SENTINEL);
+  });
+
+  it("malformed actor result (missing request_id) → service_unavailable", async () => {
+    const { idFromName } = callbackQueueStub(
+      () =>
+        ({
+          created_at: "2026-10-18T10:00:00.000Z",
+        }) as unknown as CallbackRequestResult,
+    );
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      CALLBACK_ARGS(),
+      { telnyx_conversation_id: "conv-cb-badshape" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toBe("service_unavailable");
+  });
+
+  it("rejects unexpected arguments (e.g. confirmed) via SDK invalid params", async () => {
+    const { stub, idFromName } = callbackQueueStub(() => ({
+      request_id: "req-1",
+      created_at: "2026-10-18T10:00:00.000Z",
+    }));
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      { ...CALLBACK_ARGS(), confirmed: true },
+      { telnyx_conversation_id: "conv-cb-strict" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]!.text).toMatch(/-32602/);
+    expect(stub.requestCallback).not.toHaveBeenCalled();
+  });
+
+  it("success response never contains customer name, phone, or reason", async () => {
+    const { idFromName } = callbackQueueStub(() => ({
+      request_id: "req-1",
+      created_at: "2026-10-18T10:00:00.000Z",
+    }));
+
+    const res = await callRequestCallback(
+      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      1,
+      {
+        customer_name: "Alice Smith",
+        customer_phone: "+5215512345678",
+        reason: "secret leak canary 9f2a",
+      },
+      { telnyx_conversation_id: "conv-cb-pii" },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0]!.text;
+    expect(text).not.toContain("Alice");
+    expect(text).not.toContain("Smith");
+    expect(text).not.toContain("+5215512345678");
+    expect(text).not.toContain("secret leak canary");
+    expect(text).not.toContain("customer_name");
+    expect(text).not.toContain("customer_phone");
+    expect(text).not.toContain("reason");
+  });
+
+  // --- log lines: no PII, only request_id + masked phone + latency -------
+  describe("/mcp — request_callback log hygiene", () => {
+    let logSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      logSpy.mockRestore();
+    });
+
+    function events(name: string): Array<Record<string, unknown>> {
+      return logSpy.mock.calls
+        .map((call) => call[0])
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter((e) => e.event === name);
+    }
+
+    function allSerialized(): string {
+      return logSpy.mock.calls
+        .map((call) => JSON.stringify(call))
+        .join("\n");
+    }
+
+    it("emits callback.requested with request_id, masked phone, latency, no PII", async () => {
+      const { idFromName } = callbackQueueStub(() => ({
+        request_id: "req-log-1",
+        created_at: "2026-10-18T10:00:00.000Z",
+      }));
+
+      await callRequestCallback(
+        { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+        1,
+        {
+          customer_name: "Alice Smith",
+          customer_phone: "+5215512345678",
+          reason: "secret reason canary 9f2a",
+        },
+        { telnyx_conversation_id: "conv-cb-log" },
+      );
+
+      const ev = events("callback.requested")[0];
+      expect(ev).toBeDefined();
+      expect(ev!.request_id).toBe("req-log-1");
+      expect(ev!.telnyx_conversation_id).toBe("conv-cb-log");
+      expect(ev!.phone_masked).toBe("***5678");
+      expect(typeof ev!.latency_ms).toBe("number");
+
+      const serialized = allSerialized();
+      expect(serialized).not.toContain("Alice");
+      expect(serialized).not.toContain("Smith");
+      expect(serialized).not.toContain("+5215512345678");
+      expect(serialized).not.toContain("secret reason canary");
+      expect(serialized).not.toContain("customer_name");
+      expect(serialized).not.toContain("customer_phone");
+      expect(serialized).not.toContain("reason");
+    });
+
+    it("does not emit callback.requested when the actor fails", async () => {
+      const { idFromName } = callbackQueueStub(() => {
+        throw new Error("boom");
+      });
+
+      await callRequestCallback(
+        { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+        1,
+        CALLBACK_ARGS(),
+        { telnyx_conversation_id: "conv-cb-fail" },
+      );
+
+      expect(events("callback.requested")).toHaveLength(0);
+      const toolCall = events("mcp.tool_call").find(
+        (e) => e.tool === "request_callback",
+      );
+      expect(toolCall?.outcome).toBe("service_unavailable");
+    });
   });
 });

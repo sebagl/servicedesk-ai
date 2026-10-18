@@ -623,3 +623,252 @@ describe("route not found", () => {
     assertActorNotCalled(stub);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /demo/callbacks — operator view of pending callback requests,
+// behind the same SMOKE_AUTH bearer gate as the other /demo routes.
+// ---------------------------------------------------------------------------
+
+describe("/demo/callbacks — auth gate", () => {
+  type CallbackStub = {
+    listCallbacks: ReturnType<typeof vi.fn>;
+    requestCallback: ReturnType<typeof vi.fn>;
+  };
+
+  function makeCallbackStub(entries: unknown[]): CallbackStub {
+    return {
+      listCallbacks: vi.fn(async () => entries),
+      requestCallback: vi.fn(),
+    };
+  }
+
+  function callbacksEnv(
+    stub: CallbackStub,
+    secrets: SecretsMock = validSecrets(),
+  ): unknown {
+    return {
+      CALLBACK_QUEUE: { idFromName: () => stub },
+      SECRETS: secrets,
+    };
+  }
+
+  it("missing Authorization header → 401, Actor never reached", async () => {
+    const stub = makeCallbackStub([]);
+    const env = callbacksEnv(stub);
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks"),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(stub.listCallbacks).not.toHaveBeenCalled();
+  });
+
+  it("wrong bearer → 401, Actor never reached", async () => {
+    const stub = makeCallbackStub([]);
+    const env = callbacksEnv(stub);
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer("wrong-token") }),
+      env as never,
+    );
+    expect(res.status).toBe(401);
+    expect(stub.listCallbacks).not.toHaveBeenCalled();
+  });
+
+  it("absent SECRETS binding → 503, Actor never reached", async () => {
+    const stub = makeCallbackStub([]);
+    const env = { CALLBACK_QUEUE: { idFromName: () => stub } };
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect(stub.listCallbacks).not.toHaveBeenCalled();
+  });
+
+  it("empty SMOKE_AUTH secret → 503, Actor never reached", async () => {
+    const stub = makeCallbackStub([]);
+    const env = callbacksEnv(stub, { get: vi.fn(async () => "") });
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect(stub.listCallbacks).not.toHaveBeenCalled();
+  });
+
+  it("absent CALLBACK_QUEUE binding → 503 after auth", async () => {
+    const env = { SECRETS: validSecrets() };
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "service_unavailable" });
+  });
+});
+
+describe("/demo/callbacks — success and failure", () => {
+  type CallbackStub = {
+    listCallbacks: ReturnType<typeof vi.fn>;
+    requestCallback: ReturnType<typeof vi.fn>;
+  };
+
+  function makeCallbackStub(entries: unknown[]): CallbackStub {
+    return {
+      listCallbacks: vi.fn(async () => entries),
+      requestCallback: vi.fn(),
+    };
+  }
+
+  function callbacksEnv(
+    stub: CallbackStub,
+    secrets: SecretsMock = validSecrets(),
+  ): unknown {
+    return {
+      CALLBACK_QUEUE: { idFromName: () => stub },
+      SECRETS: secrets,
+    };
+  }
+
+  it("returns entries with full operator fields (including full phone)", async () => {
+    const stub = makeCallbackStub([
+      {
+        id: "req-1",
+        conversation_id: "conv-1",
+        customer_name: "Alice Smith",
+        customer_phone: "+5215512345678",
+        reason: "oil change question",
+        created_at: "2026-10-18T10:00:00.000Z",
+      },
+      {
+        id: "req-2",
+        conversation_id: "conv-2",
+        customer_name: "Bob",
+        customer_phone: "+5215599998888",
+        reason: "tire rotation",
+        created_at: "2026-10-18T09:30:00.000Z",
+      },
+    ]);
+    const env = callbacksEnv(stub);
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    expect(stub.listCallbacks).toHaveBeenCalledTimes(1);
+    const body = (await res.json()) as {
+      callbacks: Array<{
+        id: string;
+        created_at: string;
+        customer_name: string;
+        customer_phone: string;
+        reason: string;
+      }>;
+    };
+    expect(body.callbacks).toHaveLength(2);
+    expect(body.callbacks[0]).toEqual({
+      id: "req-1",
+      created_at: "2026-10-18T10:00:00.000Z",
+      customer_name: "Alice Smith",
+      customer_phone: "+5215512345678",
+      reason: "oil change question",
+    });
+    expect(body.callbacks[1]!.customer_phone).toBe("+5215599998888");
+    // Operator view intentionally exposes the conversation_id-bearing
+    // entries; the wire shape never carries a "conversation_id" field.
+    expect(
+      (body.callbacks[0] as unknown as Record<string, unknown>)
+        .conversation_id,
+    ).toBeUndefined();
+  });
+
+  it("returns { callbacks: [] } when the queue is empty", async () => {
+    const stub = makeCallbackStub([]);
+    const env = callbacksEnv(stub);
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ callbacks: [] });
+    expect(stub.listCallbacks).toHaveBeenCalledTimes(1);
+  });
+
+  it("actor throws → 503, no entry contents leaked", async () => {
+    const SENTINEL = `__cb_list_sentinel_${Date.now()}__`;
+    const stub: CallbackStub = {
+      listCallbacks: vi.fn(async () => {
+        throw new Error(`rpc failure: ${SENTINEL}`);
+      }),
+      requestCallback: vi.fn(),
+    };
+    const env = callbacksEnv(stub);
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body).toEqual({ error: "service_unavailable" });
+    expect(JSON.stringify(body)).not.toContain(SENTINEL);
+  });
+
+  it("wrong method (POST) → 405, Actor never reached", async () => {
+    const stub = makeCallbackStub([]);
+    const env = callbacksEnv(stub);
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", {
+        method: "POST",
+        headers: bearer(VALID_TOKEN),
+      }),
+      env as never,
+    );
+    expect(res.status).toBe(405);
+    expect(stub.listCallbacks).not.toHaveBeenCalled();
+  });
+
+  it("emits callback.listed with count and latency_ms only (no entry fields)", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const stub = makeCallbackStub([
+        {
+          id: "req-1",
+          conversation_id: "conv-1",
+          customer_name: "Alice Smith",
+          customer_phone: "+5215512345678",
+          reason: "leak canary 9f2a",
+          created_at: "2026-10-18T10:00:00.000Z",
+        },
+      ]);
+      const env = callbacksEnv(stub);
+      const res = await handler.fetch(
+        new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+        env as never,
+      );
+      expect(res.status).toBe(200);
+
+      const events = logSpy.mock.calls
+        .map((call) => call[0])
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter((e) => e.event === "callback.listed");
+      expect(events).toHaveLength(1);
+      expect(events[0]!.count).toBe(1);
+      expect(typeof events[0]!.latency_ms).toBe("number");
+
+      const allSerialized = logSpy.mock.calls
+        .map((call) => JSON.stringify(call))
+        .join("\n");
+      expect(allSerialized).not.toContain("Alice");
+      expect(allSerialized).not.toContain("Smith");
+      expect(allSerialized).not.toContain("+5215512345678");
+      expect(allSerialized).not.toContain("leak canary");
+      expect(allSerialized).not.toContain("req-1");
+      expect(allSerialized).not.toContain("customer_name");
+      expect(allSerialized).not.toContain("customer_phone");
+      expect(allSerialized).not.toContain("reason");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
