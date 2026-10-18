@@ -3085,3 +3085,17 @@ This subtask does **not** add, retrieve, or print any secret value,
 does not read `.env`, does not modify remote KV, does not create
 bookings, does not install any dependency, does not deploy, and does
 not commit.
+
+## Remote create_booking through the ConversationBooking Actor (manual user execution)
+
+Date: 2026-10-17. Deployed `/mcp`, `params._meta.telnyx_conversation_id = "test-conv-001"`.
+
+| Check | Arguments | Result |
+|---|---|---|
+| New booking | oil_change, 2026-10-20 13:00 | confirmed, booking_id `4969a64d-9e83-43d1-8bd7-6a814f04e72c` |
+| Identical retry, same conversation | same | confirmed, same booking_id (no duplicate) |
+| Different time, same conversation | oil_change, 2026-10-20 14:00 | isError `conversation_already_booked` |
+
+Verified: Actor-to-Actor call (ConversationBooking → DayAgenda) works on the Edge
+runtime; one booking per conversation is enforced; conversation identity comes from
+MCP `_meta`, not tool arguments. Synthetic test data only.
