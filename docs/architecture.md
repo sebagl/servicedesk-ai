@@ -96,9 +96,11 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
   `WEBHOOK_KEY_WAIT_MS = 1000` deadline so a slow secrets backend cannot stall
   the assistant-init path; the late-resolution / late-rejection semantics
   mirror `loadConfigBounded`.
-- **800 ms bounded KV wait.** `loadConfigBounded` races `loadConfig(kv)`
-  against a fixed `CONFIG_WAIT_MS = 800` deadline; a late rejection is
-  swallowed so it cannot escape as an unhandled promise rejection.
+- **2500 ms bounded KV wait, 30 s cache.** `loadConfigBounded` races `loadConfig(kv)`
+  against `CONFIG_WAIT_MS = 2500` (raised from 800 ms after a cold-start timeout
+  in production); a successful load is cached per instance for 30 s, failures
+  are never cached, and a late rejection is swallowed so it cannot escape as an
+  unhandled promise rejection.
 - **Degraded fallback.** `CONFIG` absent, KV read rejected, or timeout →
   `200` with `system_status: "degraded"`, `booking_enabled: "false"`,
   empty `service_list`. The caller never blocks on infrastructure.
@@ -234,7 +236,7 @@ passing):
 - Full auth gate: absent/empty/rejecting secret → `503`; missing/malformed/
   wrong bearer → `401`; valid bearer → route reached.
 - Dynamic-variables webhook: method check, bounded body reader, JSON
-  parsing, payload envelope tolerance, 800 ms config race, degraded
+  parsing, payload envelope tolerance, 2500 ms config race with 30 s cache, degraded
   fallback, structured logs (masked phone, no full phone or name leakage),
   unhandled rejection suppression on late KV resolutions/rejections.
 - MCP: protocol handling, tool gating on bindings, Zod-strict input,

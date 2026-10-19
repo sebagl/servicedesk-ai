@@ -56,8 +56,17 @@ function formatBusinessHours(
 }
 
 // Cap on how long the dynamic-variables webhook will wait for KV config. A
-// slow KV must not stall the 200 the caller expects at assistant init.
-const CONFIG_WAIT_MS = 800;
+// slow KV must not stall the 200 the caller expects at assistant init. Sized
+// against the assistant's 5000 ms webhook timeout: a cold KV read exceeded the
+// previous 800 ms bound in production (config_outcome=timeout).
+const CONFIG_WAIT_MS = 2500;
+
+// A successfully loaded config is reused for this long per instance, so only
+// the first call on a cold instance pays the KV read. booking_enabled still
+// changes without a redeploy, with at most this much delay.
+const CONFIG_CACHE_TTL_MS = 30_000;
+
+let cachedConfig: { result: ConfigResult; expiresAt: number } | null = null;
 
 // Tight cap on the secrets read used to fetch the Ed25519 public key. The
 // secret store is normally warm, but a hung lookup must not stall the
@@ -68,19 +77,30 @@ const WEBHOOK_KEY_WAIT_MS = 1000;
 // Race loadConfig against a fixed deadline so the webhook cannot hang on a
 // slow KV. A late resolution is discarded; a late rejection is caught so it
 // cannot escape as an unhandled promise rejection.
+// Only successful loads are cached, including one that settles after the
+// deadline, so the next call benefits; failures are always retried.
 async function loadConfigBounded(
   kv: KvNamespace,
-): Promise<ConfigResult | "timeout"> {
+): Promise<{ result: ConfigResult | "timeout"; cached: boolean }> {
+  if (cachedConfig !== null && cachedConfig.expiresAt > Date.now()) {
+    return { result: cachedConfig.result, cached: true };
+  }
+
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const configPromise = loadConfig(kv).catch(
-    (): ConfigResult => ({ ok: false }),
-  );
+  const configPromise = loadConfig(kv)
+    .catch((): ConfigResult => ({ ok: false }))
+    .then((result) => {
+      if (result.ok) {
+        cachedConfig = { result, expiresAt: Date.now() + CONFIG_CACHE_TTL_MS };
+      }
+      return result;
+    });
   const timeoutPromise = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), CONFIG_WAIT_MS);
   });
   const outcome = await Promise.race([configPromise, timeoutPromise]);
   if (timer !== undefined) clearTimeout(timer);
-  return outcome;
+  return { result: outcome, cached: false };
 }
 
 // Module-level cache for a successfully read WEBHOOK_PUBLIC_KEY. The bound
@@ -98,6 +118,7 @@ let cachedWebhookKey: string | null = null;
 // the right time to re-read a binding that may have rotated.
 export function __resetWebhookKeyCacheForTests(): void {
   cachedWebhookKey = null;
+  cachedConfig = null;
 }
 
 // Race the secrets read for the Ed25519 verification key against the fixed
@@ -368,8 +389,14 @@ export async function handleDynamicVariables(
       ? payloadObj.telnyx_end_user_target
       : "";
   const assistantId = readSafeId(payloadObj.assistant_id);
+  // Same id the MCP tool calls carry in _meta, so one id joins the webhook,
+  // tool calls and Actor writes of a conversation.
+  const conversationId = readSafeId(
+    payloadObj.telnyx_conversation_id ?? payloadObj.conversation_id,
+  );
 
   let bookingEnabled = false;
+  let configCached = false;
   let serviceList = "";
   let businessHours = "";
   let systemStatus = "ok";
@@ -378,7 +405,8 @@ export async function handleDynamicVariables(
     configOutcome = "absent";
     systemStatus = "degraded";
   } else {
-    const cfgResult = await loadConfigBounded(env.CONFIG);
+    const { result: cfgResult, cached } = await loadConfigBounded(env.CONFIG);
+    configCached = cached;
     if (cfgResult === "timeout") {
       configOutcome = "timeout";
       systemStatus = "degraded";
@@ -410,11 +438,13 @@ export async function handleDynamicVariables(
 
   logEvent("webhook.dynamic_variables", {
     call_control_id: callControlId,
+    telnyx_conversation_id: conversationId,
     caller: maskPhone(callerRaw),
     assistant_id: assistantId,
     system_status: systemStatus,
     booking_enabled: bookingEnabled ? "true" : "false",
     config_outcome: configOutcome,
+    config_cached: configCached,
     latency_ms: Date.now() - start,
   });
   await recordMetric(env.METRICS, {

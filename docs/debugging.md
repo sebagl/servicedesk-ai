@@ -825,3 +825,84 @@ Production logs after the fix, two consecutive unsigned requests:
   cause is established from the code (200 ms bound) and the measured 708 ms lookup.
 - Cold-start lookup latency was not measured directly.
 - No load testing.
+
+## Dynamic-variables webhook: KV config read timed out on a cold instance (bookings reported disabled)
+
+### Context
+
+At conversation start, `POST /webhooks/dynamic-variables` verifies the Telnyx
+signature (public key from `SECRETS`), then loads the business config from KV
+with an 800 ms bound. If the config read times out, the webhook still answers
+200 so the call can continue, but with safe fallbacks:
+`booking_enabled = "false"` and `system_status = "degraded"`. The workflow routes
+on `booking_enabled == "true"` (Disclosure → Identify Intent); any other value
+goes to Bookings Paused.
+
+### Discovery
+
+First end-to-end web call from the Telnyx Assistant (2026-10-19). The caller
+experience was normal and a booking was created, but the runtime log showed the
+webhook had reported the system as degraded with bookings disabled, while
+`booking_enabled` in KV was `true`.
+
+### Evidence
+
+Production runtime logs (`telnyx-edge logs servicedesk-ai --tail`):
+
+- 17:41:42 — `webhook.key_lookup_completed`: `outcome=ok`, `elapsed_ms=580`,
+  `cached=false` (cold instance; signature verification succeeded, no
+  `webhook.rejected`).
+- 17:41:42 — `webhook.dynamic_variables`: `system_status=degraded`,
+  `booking_enabled=false`, `config_outcome=timeout`, `latency_ms=1400`.
+- 17:41:57 → 17:42:55 — `mcp.tool_call` `get_service_catalog`,
+  `get_availability`, `create_booking`, all `outcome=ok`, same
+  `telnyx_conversation_id`.
+- The webhook line carries `call_control_id` but not `telnyx_conversation_id`,
+  and the MCP lines carry `telnyx_conversation_id` but an empty
+  `call_control_id`, so the webhook line could not be joined to the tool calls
+  of the same conversation by a shared id.
+
+### Root cause
+
+On a cold instance the KV config read took longer than its 800 ms bound
+(`config_outcome=timeout`), on top of a 580 ms uncached secret lookup. The
+webhook therefore returned the degraded fallbacks even though KV was healthy and
+bookings were enabled. The bound was sized for Telnyx's default 1.5 s webhook
+timeout, which had since been raised to 5000 ms on the assistant.
+
+### Risk
+
+- Calls on a cold instance can be routed as if bookings were disabled (Bookings
+  Paused) even when they are enabled: a false negative on the main business path.
+- The routing outcome of this call is not fully explained: the conversation
+  booked normally although the webhook returned `booking_enabled=false`. Either
+  the call was routed to Identify Intent despite the value, or it reached
+  Bookings Paused and the model still booked because MCP tools are attached at
+  assistant level (they cannot be scoped per node in the portal). The backend
+  accepted the booking because the Actor re-reads KV, where bookings are enabled.
+- No data exposure; the webhook failed safe (200 with conservative fallbacks).
+
+### Fix
+
+Planned (not yet deployed at the time of writing):
+
+1. Raise the config read bound from 800 ms to 2500 ms, within the assistant's
+   5000 ms webhook timeout.
+2. Cache a successfully loaded config in memory for 30 s per instance, so only
+   the first call on an instance reads KV. `booking_enabled` still changes
+   without a redeploy, with at most 30 s delay.
+3. Log `telnyx_conversation_id` on `webhook.dynamic_variables`, so a single id
+   joins the webhook, MCP tool calls and Actor writes for one conversation.
+
+### Verification
+
+Pending: after deploying, a cold-start web call should log
+`config_outcome=ok`, `system_status=ok`, `booking_enabled=true`, and the webhook
+line should share its `telnyx_conversation_id` with the tool-call lines.
+
+### Limits
+
+- Only one cold-start occurrence observed; KV read latency was not measured
+  directly (only the timeout was recorded).
+- The node path taken by this conversation was not confirmed from the
+  assistant's conversation history.

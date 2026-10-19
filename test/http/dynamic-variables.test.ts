@@ -1903,3 +1903,79 @@ describe("/webhooks/dynamic-variables — WEBHOOK_PUBLIC_KEY cache", () => {
     expect(valid.SECRETS!.get).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("/webhooks/dynamic-variables — config cache and conversation id", () => {
+  function webhookEvents(): Array<Record<string, unknown>> {
+    return logEvents().filter((e) => e.event === "webhook.dynamic_variables");
+  }
+
+  it("second call within the TTL reuses the config without reading KV", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const env = secretsEnv(keyPair.publicKeyBase64, kv);
+    await handler.fetch(await webhookReq(initPayload("+15550000001")), env as never);
+    await handler.fetch(await webhookReq(initPayload("+15550000001")), env as never);
+
+    expect(kv.get).toHaveBeenCalledTimes(1);
+    const [first, second] = webhookEvents();
+    expect(first?.config_cached).toBe(false);
+    expect(second?.config_cached).toBe(true);
+    expect(second?.booking_enabled).toBe("true");
+  });
+
+  it("a failed config load is not cached; the next call reads KV again", async () => {
+    const failing = rejectingKv();
+    await handler.fetch(
+      await webhookReq(initPayload("+15550000001")),
+      secretsEnv(keyPair.publicKeyBase64, failing) as never,
+    );
+    const healthy = validKv(VALID_CONFIG);
+    await handler.fetch(
+      await webhookReq(initPayload("+15550000001")),
+      secretsEnv(keyPair.publicKeyBase64, healthy) as never,
+    );
+
+    expect(healthy.get).toHaveBeenCalledTimes(1);
+    const [first, second] = webhookEvents();
+    expect(first?.system_status).toBe("degraded");
+    expect(second?.system_status).toBe("ok");
+    expect(second?.config_cached).toBe(false);
+  });
+
+  it("the config is read from KV again after the 30 s TTL", async () => {
+    const kv = validKv(VALID_CONFIG);
+    const env = secretsEnv(keyPair.publicKeyBase64, kv);
+    const nowSpy = vi.spyOn(Date, "now");
+    const t0 = Date.now();
+    nowSpy.mockReturnValue(t0);
+    try {
+      await handler.fetch(await webhookReq(initPayload("+15550000001")), env as never);
+      nowSpy.mockReturnValue(t0 + 31_000);
+      await handler.fetch(
+        await webhookReq(initPayload("+15550000001"), {
+          timestampHeader: Math.floor((t0 + 31_000) / 1000),
+        }),
+        env as never,
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+    expect(kv.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("logs the telnyx_conversation_id from the payload", async () => {
+    const env = secretsEnv(keyPair.publicKeyBase64, validKv(VALID_CONFIG));
+    const body = JSON.stringify({
+      data: {
+        event_type: "assistant.initialization",
+        payload: {
+          telnyx_end_user_target: "+15550000001",
+          telnyx_conversation_id: "496eb5af-7354-4f16-b588-c88c299fb5cf",
+        },
+      },
+    });
+    await handler.fetch(await webhookReq(body), env as never);
+    expect(webhookEvents()[0]?.telnyx_conversation_id).toBe(
+      "496eb5af-7354-4f16-b588-c88c299fb5cf",
+    );
+  });
+});
