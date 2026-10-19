@@ -193,12 +193,6 @@ OpenCode with the `@telnyx/opencode` plugin — config in
 - **Models:** `zai-org/GLM-5.2` for the foundation and booking domain;
   `MiniMaxAI/MiniMax-M3` for later, well-scoped tasks. The voice assistant itself runs
   on `moonshotai/Kimi-K2.6`.
-- **What we learned:** the first ~$40 of inference went almost entirely to re-sending
-  context. One long session grew from ~10K to 516K tokens per request (98% cache hit,
-  ~700:1 input/output ratio). Switching to one short session per task and a cheaper
-  model cut the cost per request by roughly 15x for the same kind of work.
-- **Platform notes:** the plugin does not register model prices, so OpenCode shows
-  $0 while the account is being billed; the Telnyx dashboard was the only source of truth.
 
 ## Setup
 
