@@ -99,7 +99,8 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
 - **2500 ms bounded KV wait, 30 s cache.** `loadConfigBounded` races `loadConfig(kv)`
   against `CONFIG_WAIT_MS = 2500` (raised from 800 ms after a cold-start timeout
   in production); a successful load is cached per instance for 30 s, failures
-  are never cached, and a late rejection is swallowed so it cannot escape as an
+  are never cached, a slow or failed read falls back to the last good config
+  (up to 10 minutes old, logged as `config_outcome: "stale"`), and a late rejection is swallowed so it cannot escape as an
   unhandled promise rejection.
 - **Degraded fallback.** `CONFIG` absent, KV read rejected, or timeout →
   `200` with `system_status: "degraded"`, `booking_enabled: "false"`,

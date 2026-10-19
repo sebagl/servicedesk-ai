@@ -66,6 +66,12 @@ const CONFIG_WAIT_MS = 2500;
 // changes without a redeploy, with at most this much delay.
 const CONFIG_CACHE_TTL_MS = 30_000;
 
+// When KV is slow or failing, the last good config is still used for up to
+// this long instead of reporting bookings as disabled. Production showed cold
+// KV reads above 2500 ms; a stale-but-recent config is a better answer than a
+// false "bookings disabled". Only an instance that never loaded config degrades.
+const CONFIG_STALE_MAX_MS = 10 * 60_000;
+
 let cachedConfig: { result: ConfigResult; expiresAt: number } | null = null;
 
 // Tight cap on the secrets read used to fetch the Ed25519 public key. The
@@ -81,9 +87,9 @@ const WEBHOOK_KEY_WAIT_MS = 1000;
 // deadline, so the next call benefits; failures are always retried.
 async function loadConfigBounded(
   kv: KvNamespace,
-): Promise<{ result: ConfigResult | "timeout"; cached: boolean }> {
+): Promise<{ result: ConfigResult | "timeout"; cached: boolean; stale: boolean }> {
   if (cachedConfig !== null && cachedConfig.expiresAt > Date.now()) {
-    return { result: cachedConfig.result, cached: true };
+    return { result: cachedConfig.result, cached: true, stale: false };
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -100,7 +106,15 @@ async function loadConfigBounded(
   });
   const outcome = await Promise.race([configPromise, timeoutPromise]);
   if (timer !== undefined) clearTimeout(timer);
-  return { result: outcome, cached: false };
+
+  const failed = outcome === "timeout" || !outcome.ok;
+  const staleUsable =
+    cachedConfig !== null &&
+    Date.now() - (cachedConfig.expiresAt - CONFIG_CACHE_TTL_MS) <= CONFIG_STALE_MAX_MS;
+  if (failed && staleUsable) {
+    return { result: cachedConfig!.result, cached: true, stale: true };
+  }
+  return { result: outcome, cached: false, stale: false };
 }
 
 // Module-level cache for a successfully read WEBHOOK_PUBLIC_KEY. The bound
@@ -400,12 +414,12 @@ export async function handleDynamicVariables(
   let serviceList = "";
   let businessHours = "";
   let systemStatus = "ok";
-  let configOutcome: "ok" | "timeout" | "load_failed" | "absent" = "ok";
+  let configOutcome: "ok" | "stale" | "timeout" | "load_failed" | "absent" = "ok";
   if (env.CONFIG === undefined) {
     configOutcome = "absent";
     systemStatus = "degraded";
   } else {
-    const { result: cfgResult, cached } = await loadConfigBounded(env.CONFIG);
+    const { result: cfgResult, cached, stale } = await loadConfigBounded(env.CONFIG);
     configCached = cached;
     if (cfgResult === "timeout") {
       configOutcome = "timeout";
@@ -414,7 +428,7 @@ export async function handleDynamicVariables(
       configOutcome = "load_failed";
       systemStatus = "degraded";
     } else {
-      configOutcome = "ok";
+      configOutcome = stale ? "stale" : "ok";
       bookingEnabled = cfgResult.config.business.booking_enabled;
       serviceList = cfgResult.config.services
         .map((s) => s.name)

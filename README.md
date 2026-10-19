@@ -78,7 +78,7 @@ Three tools, all bound to the same MCP server (stateless per-request):
 `POST /webhooks/dynamic-variables` answers at assistant init with
 `dynamic_variables` (`booking_enabled`, `system_status`, `today_local`,
 `today_weekday`, `now_local_time`, `business_hours`, `service_list`). KV config
-load is cached for 30 s per instance and raced against a **2500 ms** deadline; missing/slow/loaded-failed
+load is cached for 30 s per instance and raced against a **2500 ms** deadline (if KV is slow or failing, the last good config up to 10 minutes old is used and logged as `config_outcome: "stale"`); missing/slow/loaded-failed
 config returns `200` with `system_status: "degraded"` and
 `booking_enabled: "false"`. Every delivery is authenticated against the
 Ed25519 public key stored in the `WEBHOOK_PUBLIC_KEY` secret binding

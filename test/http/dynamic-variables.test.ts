@@ -1979,3 +1979,62 @@ describe("/webhooks/dynamic-variables — config cache and conversation id", () 
     );
   });
 });
+
+describe("/webhooks/dynamic-variables — stale config fallback", () => {
+  function webhookEvents(): Array<Record<string, unknown>> {
+    return logEvents().filter((e) => e.event === "webhook.dynamic_variables");
+  }
+
+  async function callAt(ms: number, env: unknown): Promise<Response> {
+    return handler.fetch(
+      await webhookReq(initPayload("+15550000001"), { timestampHeader: Math.floor(ms / 1000) }),
+      env as never,
+    );
+  }
+
+  it("uses the last good config when KV fails after the TTL", async () => {
+    const kv: KvMock = { get: vi.fn(async () => VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, kv);
+    const nowSpy = vi.spyOn(Date, "now");
+    const t0 = Date.now();
+    try {
+      nowSpy.mockReturnValue(t0);
+      await callAt(t0, env);
+      kv.get.mockImplementation(async () => {
+        throw new Error("network error");
+      });
+      nowSpy.mockReturnValue(t0 + 60_000);
+      const res = await callAt(t0 + 60_000, env);
+      const body = (await res.json()) as { dynamic_variables: Record<string, string> };
+      expect(body.dynamic_variables.booking_enabled).toBe("true");
+      expect(body.dynamic_variables.system_status).toBe("ok");
+    } finally {
+      nowSpy.mockRestore();
+    }
+    const second = webhookEvents()[1];
+    expect(second?.config_outcome).toBe("stale");
+    expect(second?.config_cached).toBe(true);
+  });
+
+  it("degrades when the last good config is older than 10 minutes", async () => {
+    const kv: KvMock = { get: vi.fn(async () => VALID_CONFIG) };
+    const env = secretsEnv(keyPair.publicKeyBase64, kv);
+    const nowSpy = vi.spyOn(Date, "now");
+    const t0 = Date.now();
+    try {
+      nowSpy.mockReturnValue(t0);
+      await callAt(t0, env);
+      kv.get.mockImplementation(async () => {
+        throw new Error("network error");
+      });
+      nowSpy.mockReturnValue(t0 + 11 * 60_000);
+      const res = await callAt(t0 + 11 * 60_000, env);
+      const body = (await res.json()) as { dynamic_variables: Record<string, string> };
+      expect(body.dynamic_variables.booking_enabled).toBe("false");
+      expect(body.dynamic_variables.system_status).toBe("degraded");
+    } finally {
+      nowSpy.mockRestore();
+    }
+    expect(webhookEvents()[1]?.config_outcome).toBe("load_failed");
+  });
+});

@@ -8,9 +8,14 @@ import { startToolCall, toolError, toolJson, type ToolContext } from "../tool-re
 
 const INPUT = z
   .object({
-    service_id: z.string().trim().min(1).max(128),
-    date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/),
-    time: z.string().trim().regex(/^\d{2}:\d{2}$/),
+    service_id: z
+      .string()
+      .trim()
+      .min(1)
+      .max(128)
+      .describe("Service id from get_service_catalog, e.g. \"oil_change\" — not the display name."),
+    date: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).describe("YYYY-MM-DD"),
+    time: z.string().trim().regex(/^\d{2}:\d{2}$/).describe("HH:mm, a time returned by get_availability"),
     customer_name: z.string().trim().min(1).max(256),
     customer_phone: z.string().trim().min(1).max(64),
     confirmed: z.boolean(),
@@ -82,7 +87,7 @@ export function registerCreateBooking(
     "create_booking",
     {
       description:
-        "Create the appointment. Call ONLY after the caller explicitly confirmed service, date and time; set confirmed=true only then. Use a time returned by get_availability. Retrying with identical arguments is safe and returns the same booking.",
+        "Create the appointment. service_id must be an id from get_service_catalog (e.g. oil_change). Call ONLY after the caller explicitly confirmed service, date and time; set confirmed=true only then. Use a time returned by get_availability. Retrying with identical arguments is safe and returns the same booking.",
       inputSchema: INPUT,
     },
     async (
