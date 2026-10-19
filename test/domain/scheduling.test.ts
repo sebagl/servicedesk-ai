@@ -55,7 +55,7 @@ function localEpochMS(date: string, hour: number, minute: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Date validation (covers: malformed dates spec item)
+// Date validation (malformed and impossible dates)
 // ---------------------------------------------------------------------------
 
 describe("date validation", () => {
@@ -94,7 +94,7 @@ describe("date validation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Month/year boundaries (covers: spec item 5 — month/year boundaries)
+// Month/year boundaries
 // ---------------------------------------------------------------------------
 
 describe("month/year boundaries (addDays)", () => {
@@ -136,7 +136,7 @@ describe("leap date validation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Time validation (covers: spec item 6 — invalid start times)
+// Time validation
 // ---------------------------------------------------------------------------
 
 describe("time validation", () => {
@@ -239,7 +239,7 @@ describe("getLocalDateString", () => {
 });
 
 // ---------------------------------------------------------------------------
-// UTC date vs. local date (spec item 4)
+// UTC date vs. local date
 // ---------------------------------------------------------------------------
 
 describe("instant whose UTC date differs from Mexico City date", () => {
@@ -294,7 +294,7 @@ describe("getBookingWindowDates", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Window boundaries (spec item 3)
+// Window boundaries
 // ---------------------------------------------------------------------------
 
 describe("window boundaries — today+6 included, today+7 excluded", () => {
@@ -317,17 +317,15 @@ describe("window boundaries — today+6 included, today+7 excluded", () => {
     expect(err).toBe("date_out_of_range");
   });
   it("validateSlotRequest accepts today+6 (still in window, even if weekend)", () => {
-    // Oct 25 is Sunday → would later fail date_not_open, but it passes window check
-    // Wait — validateSlotRequest checks date_not_open before date_out_of_range
-    // Actually, our order: date_invalid → date_out_of_range → date_not_open → time_invalid → slot_in_past
-    // So "2026-10-25" passes date and window checks, fails date_not_open
+    // Check order: date_invalid → date_out_of_range → date_not_open → time_invalid →
+    // slot_in_past. Oct 25 (Sunday) is inside the window, so it fails on date_not_open.
     const err = validateSlotRequest("2026-10-25", "09:00", now, CONFIG);
     expect(err).toBe("date_not_open");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Eight slots on future weekday; none on weekends (spec item 1)
+// Eight slots on future weekday; none on weekends
 // ---------------------------------------------------------------------------
 
 describe("eight slots on a future weekday; none on weekends", () => {
@@ -368,7 +366,7 @@ describe("eight slots on a future weekday; none on weekends", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Today's elapsed slots and exact-start boundary (spec item 2)
+// Today's elapsed slots and exact-start boundary
 // ---------------------------------------------------------------------------
 
 describe("today's elapsed slots at 10:30 local", () => {

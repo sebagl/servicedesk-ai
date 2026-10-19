@@ -1,12 +1,13 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+
 import type { Env } from "../env";
 
+// Compares fixed-length SHA-256 digests so neither the content nor the length
+// of the secret leaks through timing.
 export function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return mismatch === 0;
+  const digestA = createHash("sha256").update(a).digest();
+  const digestB = createHash("sha256").update(b).digest();
+  return timingSafeEqual(digestA, digestB);
 }
 
 export function extractBearer(req: Request): string | null {

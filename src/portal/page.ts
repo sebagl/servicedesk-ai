@@ -33,9 +33,9 @@ export const PORTAL_HTML = `<!doctype html>
 </head>
 <body>
 <main id="root"></main>
-<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js" crossorigin></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js" integrity="sha384-toVdrLSMaw7Y55MowcKqkmFL/Ek6Sky62NOk0b5sDDZBu2wcoPyyQUt9unDVjXhL" crossorigin="anonymous"></script>
 <script>
 (function () {
   var html = htm.bind(React.createElement);

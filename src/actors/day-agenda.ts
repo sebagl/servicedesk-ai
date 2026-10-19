@@ -335,8 +335,8 @@ export class DayAgenda extends StatefulActor {
 
       if (fingerprint === existingEntry.input_hash) {
         // Identical replay → return original booking result.
-        // Per [C6]: this succeeds even if booking_enabled was later disabled
-        // or the slot is now past. No write performed.
+        // A confirmed booking stays confirmed: the replay succeeds even if
+        // booking_enabled was later disabled or the slot is now past. No write.
         const originalBooking =
           state.bookings[existingEntry.booking_time]!;
         return {

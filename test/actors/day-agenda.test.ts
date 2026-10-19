@@ -612,7 +612,7 @@ describe("DayAgenda.createBooking", () => {
       expect(r2.code).toBe("idempotency_key_conflict");
     });
 
-    it("replay after booking_enabled=false -> original success [C6]", async () => {
+    it("replay after booking_enabled=false -> original success", async () => {
       let storedState: DayAgendaState | undefined;
       const put = vi.fn(async (_key: string, value: unknown) => {
         storedState = value as DayAgendaState;
@@ -633,7 +633,7 @@ describe("DayAgenda.createBooking", () => {
       expect(put2).not.toHaveBeenCalled();
     });
 
-    it("replay after advancing clock past slot -> original success [C6]", async () => {
+    it("replay after advancing clock past slot -> original success", async () => {
       let storedState: DayAgendaState | undefined;
       const put = vi.fn(async (_key: string, value: unknown) => {
         storedState = value as DayAgendaState;
@@ -654,7 +654,7 @@ describe("DayAgenda.createBooking", () => {
       expect(put2).not.toHaveBeenCalled();
     });
 
-    it("replay after service removed from catalog -> original success [C6]", async () => {
+    it("replay after service removed from catalog -> original success", async () => {
       let storedState: DayAgendaState | undefined;
       const put = vi.fn(async (_key: string, value: unknown) => {
         storedState = value as DayAgendaState;

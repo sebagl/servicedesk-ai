@@ -221,6 +221,18 @@ telnyx-edge secrets add TELNYX_PUBLIC_KEY "<account public key, base64>"
 telnyx-edge ship
 ```
 
+Remote verification scripts (each creates one synthetic booking on the given slot):
+
+```bash
+# 20 concurrent bookings for one slot: expects 1 confirmed, 19 slot_unavailable
+SMOKE_TEST_TOKEN=<token> node scripts/verify-booking-concurrency.mjs \
+  --base-url <function-url> --date <YYYY-MM-DD> --time <HH:mm> --run-id <id>
+
+# One booking per conversation over MCP: confirm, identical retry, second booking rejected
+MCP_API_TOKEN=<token> node scripts/verify-mcp-conversation.mjs \
+  --base-url <function-url> --date <YYYY-MM-DD> --time <HH:mm> --alternate-time <HH:mm> --run-id <id>
+```
+
 Assistant configuration (Telnyx portal):
 
 1. **MCP server:** URL `…/mcp`, type HTTP, API key = an integration secret holding

@@ -5,6 +5,7 @@ import {
   TIMEZONE,
   SLOT_HOURS,
   BOOKING_WINDOW_DAYS,
+  SLOT_DURATION_MINUTES,
 } from "./business-rules";
 
 export interface Service {
@@ -60,7 +61,7 @@ function validateService(raw: unknown, ids: Set<string>): Service | null {
   const r = raw as Record<string, unknown>;
   if (!isString(r.id) || r.id.length === 0) return null;
   if (!isString(r.name) || r.name.length === 0) return null;
-  if (!isNumber(r.duration_minutes) || r.duration_minutes !== 60) return null;
+  if (!isNumber(r.duration_minutes) || r.duration_minutes !== SLOT_DURATION_MINUTES) return null;
   if (ids.has(r.id)) return null;
   ids.add(r.id);
   return { id: r.id, name: r.name, duration_minutes: r.duration_minutes };

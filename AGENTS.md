@@ -46,6 +46,6 @@ telnyx-edge types    # regenerate telnyx-env.d.ts from manifest
 - **Demo routes** (`/demo/*`) are auth-gated by `SMOKE_AUTH` (`SMOKE_TEST_TOKEN`).
 - **KV** holds config only; never transactional booking state.
 - **Actor** (`DayAgenda`) owns authoritative occupancy + idempotency per location/day.
-- **booking_enabled** is an admission flag; replays bypass it ([C6]).
+- **booking_enabled** is an admission flag; replays of confirmed bookings bypass it.
 - **fail-closed:** infra failures → `503 { error: "service_unavailable" }`.
 - **Timezone:** `America/Mexico_City` always; never use browser/process TZ.

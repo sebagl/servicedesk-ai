@@ -15,7 +15,7 @@ type    = "DayAgenda"
 
 # Conversation Actor — one instance per trusted Telnyx conversation.
 # Coordinates booking attempts across dates; persists the one-booking-per-
-# conversation aggregate (booking-domain.md §10).
+# conversation aggregate (see docs/architecture.md).
 [[actors]]
 binding = "CONVERSATION_BOOKING"
 type    = "ConversationBooking"
