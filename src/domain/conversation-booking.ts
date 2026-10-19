@@ -4,7 +4,7 @@ import type {
 } from "../services/booking";
 
 // ---------------------------------------------------------------------------
-// Conversation-scoped booking coordinator (booking-domain.md §10).
+// Conversation-scoped booking coordinator (see docs/architecture.md).
 // Persists one aggregate per conversation: idle, pending, or confirmed.
 // Pending and confirmed both carry the saved normalized input, the stable
 // backend-generated attempt key, and the original location_id; confirmed

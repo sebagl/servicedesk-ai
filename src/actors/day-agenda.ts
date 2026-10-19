@@ -10,7 +10,7 @@ import {
 import type { AppConfig } from "../domain/config";
 
 // ---------------------------------------------------------------------------
-// Persisted state — the daily agenda aggregate (booking-domain.md §6).
+// Persisted state — the daily agenda aggregate (see docs/architecture.md).
 // Occupancy + idempotency persisted together in a single key.
 // ---------------------------------------------------------------------------
 

@@ -19,7 +19,7 @@ import { LOCATION_ID } from "../domain/business-rules";
 
 // ---------------------------------------------------------------------------
 // ConversationBooking — one StatefulActor per trusted Telnyx conversation
-// (booking-domain.md §10). Persists a single aggregate (idle / pending /
+// (see docs/architecture.md). Persists a single aggregate (idle / pending /
 // confirmed) keyed under "booking". Confirmed replays return the stored
 // result without loading KV or contacting AGENDA — those bindings are only
 // consulted inside the executor path. RPC callers never supply config,

@@ -37,7 +37,7 @@ telnyx-edge types    # regenerate telnyx-env.d.ts from manifest
 - `src/portal/` — operator portal HTML page
 - `config/main.json` — non-sensitive demo seed configuration
 - `test/` — Vitest suite mirroring `src/` folders, plus `integration/` and `support/`
-- `docs/` — architecture, verification, debugging, booking-domain spec
+- `docs/` — architecture, debugging, verification, demo script
 - `scripts/` — remote verification scripts
 
 ## Key Contracts

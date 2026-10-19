@@ -1,232 +1,267 @@
 # ServiceDesk AI
 
-An AI receptionist for a fictional auto repair shop, built on Telnyx Edge Compute.
+A voice receptionist for an independent auto repair shop in Mexico City. Callers
+ask about services, check real availability and book an appointment in one call;
+if they need a person, the assistant records a callback request instead of
+pretending to transfer. Everything behind the voice runs on Telnyx Edge Compute.
 
-This repository contains the booking-domain implementation (HTTP + MCP adapters,
-KV config, per-location/day Actor). See [docs/architecture.md](docs/architecture.md)
-for the full design and [docs/verification.md](docs/verification.md) for recorded
-evidence.
+**Target users:** small service businesses (repair shops, clinics, salons) that
+miss calls while their staff is busy, and lose bookings because nobody answers.
 
-## Prerequisites
+| | |
+|---|---|
+| Function URL | `https://servicedesk-ai-a666861a-1.telnyxcompute.com` |
+| Dynamic variables webhook | `POST /webhooks/dynamic-variables` (Telnyx signature) |
+| MCP server | `POST /mcp` (streamable HTTP, bearer token) |
+| Operator portal | `GET /portal` (data behind a portal token) |
+| Health | `GET /health` |
+| Access | Telnyx **web call** from the assistant page. The trial account can only purchase Mexico local numbers, which were out of stock, so no phone number is attached. |
 
-- **Node.js 20+** (tested on v20.20.0)
-- **npm** (tested on 10.8.2)
-- **`telnyx-edge` CLI v0.5.12+** — install to `~/.local/bin` (no sudo):
-  ```bash
-  curl -sSL https://github.com/team-telnyx/edge-compute/releases/download/v0.5.12/telnyx-edge-v0.5.12-macos-arm64.tar.gz | tar -xzf -
-  mv telnyx-edge-v0.5.12-macos-arm64/telnyx-edge ~/.local/bin/telnyx-edge
-  chmod +x ~/.local/bin/telnyx-edge
-  telnyx-edge --version  # → v0.5.12
-  ```
-  Adjust the platform suffix for your architecture (`linux-amd64`, `linux-arm64`,
-  `macos-amd64`, `windows-amd64.zip`).
-- **Docker + Compose v2.17+** — only needed for `telnyx-edge dev` (local runtime;
-  not required for typecheck or mocked tests). Local `dev` does **not** emulate
-  `[[secrets]]` or `[storage.kv]` bindings — auth-gated demo routes return
-  `503`, `/mcp` returns `503`, and the dynamic-variables webhook answers
-  `200 degraded` (its KV-wait fallback is exercised by the mocked test suite).
+Further reading: [architecture](docs/architecture.md) ·
+[debugging stories](docs/debugging.md) · [verification](docs/verification.md) ·
+[demo script](docs/demo-script.md)
 
-## Manifest and entrypoint
+## How to interact
 
-This project uses a **`telnyx.toml`** umbrella manifest — not `func.toml`.
+Call the assistant (or start a web call) and speak in English:
 
-| Convention | Manifest | HTTP entrypoint | StatefulActors |
+- *"What services do you offer?"* — answers from the live catalog.
+- *"I'd like an oil change on Thursday."* — offers real open times, collects your
+  name and phone, reads the booking back and confirms only after your "yes".
+- *"Can I come on Saturday?"* — explains the shop is closed and suggests a weekday.
+- *"I want to talk to a person."* — records a callback request for the team.
+
+Business rules: Monday–Friday, 09:00–17:00 (last start 16:00), 60-minute slots,
+one car per slot, bookings up to 7 days ahead, `America/Mexico_City` time.
+
+## Architecture
+
+```text
+Caller (phone / web call)
+   │
+   ▼
+Telnyx AI Assistant ── Conversation Workflow (speak + prompt nodes, LLM and variable edges)
+   │                               │
+   │ assistant init                │ tool calls (params._meta.telnyx_conversation_id)
+   ▼                               ▼
+┌──────────────────────── Telnyx Edge Function (servicedesk-ai) ────────────────────────┐
+│  /webhooks/dynamic-variables        /mcp (4 tools)               /portal + /api/*      │
+│          │                             │                              │               │
+│          ▼                             ▼                              ▼               │
+│   KV: catalog, hours,      Actors: DayAgenda (per day)       reads Actors + Metrics   │
+│   booking_enabled flag             ConversationBooking (per call)                     │
+│                                    DayCallbacks (per day)                             │
+│                                    Metrics (per day)                                  │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+   │
+   ▼
+Structured JSON logs (telnyx-edge logs) + Metrics actor counters (portal Observability tab)
+```
+
+Details, request flows and failure modes: [docs/architecture.md](docs/architecture.md).
+
+## Conversation workflow
+
+| Node | Type | Purpose | Instructions |
 |---|---|---|---|
-| `func.toml` (classic) | `func.toml` | You own a `node:http` server on `PORT \|\| 8080` | Not supported |
-| `telnyx.toml` (umbrella) | `telnyx.toml` | `export default { async fetch(req, env) }` — runtime serves it | TypeScript-only |
+| Disclosure | speak | Verbatim AI/recording disclosure | — |
+| Identify Intent | prompt | Information, booking or a person | Append |
+| Answer FAQ | prompt | Services and hours from `get_service_catalog` | Append |
+| Collect Details | prompt | Service, date, time, name, phone; offers only times from `get_availability` | Append |
+| Confirm | prompt | Reads the booking back, waits for an explicit yes | Append |
+| Book | prompt | Calls `create_booking`; claims success only on `status: confirmed` | Append |
+| Bookings Paused | prompt | Bookings switched off: answers questions, no booking | Append |
+| Callback Request | prompt | Records `request_callback` instead of a fake transfer | Append |
+| Escalate, Goodbye | speak | Verbatim closing messages | — |
+| End Call | prompt | Hangs up and says nothing else | **Replace** |
 
-StatefulActors require `telnyx.toml`, so this project uses the fetch-handler
-contract. There is no Express, Hono, or custom `node:http` server.
+Routing decisions:
 
-Source: [Project Structure](https://developers.telnyx.com/docs/edge-compute/stateful-actors/guides/project-structure)
+- **Variable comparison** for business rules: `booking_enabled == "true"` (from the
+  webhook) decides between Identify Intent and Bookings Paused. Anything else —
+  including a failed webhook — falls to Bookings Paused.
+- **LLM conditions** for caller intent: general question, wants to book, wants a
+  person, confirmed, wants changes.
+- **Append** keeps the global persona, today's date and the "never invent facts"
+  rule in every step; **Replace** is used only for End Call, whose only job is to
+  hang up.
+- **Speak nodes** carry everything that must be said word for word.
 
-## HTTP routes
+**Tool scoping:** the portal attaches MCP servers at assistant level, so MCP tools
+cannot be restricted per node in the UI. Each node's instructions name the only
+tools it may use, and the backend is the real guard: `create_booking` requires
+`confirmed=true`, the day Actor re-checks every business rule and the flag, and a
+conversation can book only once.
 
-- `GET /health`, `/health/liveness`, `/health/readiness` — public liveness only;
-  do not prove KV or Actor reachability.
-- `POST /webhooks/dynamic-variables` — Telnyx assistant init webhook (see below).
-- `POST /mcp` — MCP server (stateless streamable HTTP, JSON responses), auth-gated
-  by `MCP_AUTH`. Browser `Origin` is rejected with `404`.
-- `/demo/*` — smoke-test routes, auth-gated by `SMOKE_AUTH` (`SMOKE_TEST_TOKEN`):
-  - `GET /demo/config` — returns the validated KV config.
-  - `GET /demo/availability?date=YYYY-MM-DD` — slots for one date, marked with
-    `DayAgenda` occupancy.
-  - `POST /demo/bookings` — create one booking (delegates to the Actor).
-  - `GET /demo/callbacks` — pending callback requests across the last 7 local
-    days, merged newest first from one `DayCallbacks` actor per day.
+## MCP server
 
-## MCP tools
+Custom MCP server on the same Edge Function (`src/mcp/`), official MCP TypeScript
+SDK, stateless streamable HTTP, Zod-strict inputs, one file per tool:
 
-Three tools, all bound to the same MCP server (stateless per-request):
-- `get_service_catalog` — services + `booking_enabled` admission flag.
-  Usable without conversation metadata.
-- `get_availability` — open slots for a `YYYY-MM-DD` date. Usable without
-  conversation metadata.
-- `create_booking` — write path; routes through the
-  `ConversationBooking` Actor keyed by conversation id
-  (`params._meta["telnyx_conversation_id"]`, sha256-hashed). Requires
-  conversation metadata: missing or invalid metadata returns
-  `conversation_id_required` and never reaches an Actor. Conversation
-  identity is read from SDK metadata only — never from tool arguments
-  or correlation headers. One confirmed booking per conversation is
-  enforced by the Actor; changed input after a confirmed booking
-  returns `conversation_already_booked`. Customer PII (name, phone)
-  never leaves the boundary in any response.
+| Tool | What it does | State touched |
+|---|---|---|
+| `get_service_catalog` | Services and the `booking_enabled` flag | KV |
+| `get_availability` | Open times for one date | KV + `DayAgenda` |
+| `create_booking` | Books a confirmed slot; retries are safe | `ConversationBooking` → `DayAgenda` |
+| `request_callback` | Records a callback request for the team | `DayCallbacks` |
 
-## Telnyx AI Assistant init webhook
+Conversation identity comes from `params._meta.telnyx_conversation_id`, which the
+Telnyx platform sets (not the model). Write tools require it. Responses never
+contain customer names or phone numbers.
 
-`POST /webhooks/dynamic-variables` answers at assistant init with
-`dynamic_variables` (`booking_enabled`, `system_status`, `today_local`,
-`today_weekday`, `now_local_time`, `business_hours`, `service_list`). KV config
-load is cached for 30 s per instance and raced against a **2500 ms** deadline (if KV is slow or failing, the last good config up to 10 minutes old is used and logged as `config_outcome: "stale"`); missing/slow/loaded-failed
-config returns `200` with `system_status: "degraded"` and
-`booking_enabled: "false"`. Every delivery is authenticated against the
-Ed25519 public key stored in the `WEBHOOK_PUBLIC_KEY` secret binding
-(`TELNYX_PUBLIC_KEY`); the verifier verifies `${timestamp}|${rawBody}` and
-enforces a ±300 s replay window. A missing or slow secret lookup, a malformed
-key, or an `invalid_configuration` from `crypto.subtle` fails closed with
-`503 { error: "service_unavailable" }`; an unverified signature returns
-`401 { error: "unauthorized" }`. See `src/http/webhook-signature.ts` and
-`src/http/routes/dynamic-variables.ts`.
+## Dynamic webhook variables
+
+At assistant init Telnyx calls `POST /webhooks/dynamic-variables`. The function
+verifies the Ed25519 signature, reads the business config from KV and returns:
+
+| Variable | Used for |
+|---|---|
+| `booking_enabled` | **Workflow routing** (variable comparison edge) |
+| `system_status` | `ok` / `degraded`, visible to the model and the logs |
+| `today_local`, `today_weekday`, `now_local_time` | Turning "tomorrow" or "next Monday" into dates in the shop's time zone |
+| `business_hours`, `service_list` | Greeting and answers without an extra tool call |
+
+Flipping `booking_enabled` in KV changes the call flow without a redeploy (within
+30 s, the config cache TTL).
+
+## Choosing Function vs KV vs Actor
+
+| Primitive | Holds | Why |
+|---|---|---|
+| **KV** | Catalog, hours, `booking_enabled` | Read-mostly config and a feature flag that changes without redeploy. Never booking state. |
+| **Function logic** | Scheduling rules, validation, signature checks, KPI math | Stateless; no entity owns it. |
+| **`DayAgenda` Actor** (one per day) | That day's bookings | Check-and-book is a read-modify-write; single-threaded execution means two callers cannot get the same slot (remote test: 20 concurrent requests → 1 booked, 19 `slot_unavailable`). |
+| **`ConversationBooking` Actor** (one per call) | idle → pending → confirmed | One booking per conversation and safe retries; calls `DayAgenda` (actor to actor). |
+| **`DayCallbacks` Actor** (one per day) | That day's callback requests | Appends without losing concurrent requests; idempotent per conversation. |
+| **`Metrics` Actor** (one per day) | Counters, latency sums, recent events | Counters are read-modify-write; feeds KPIs and the Observability tab. |
+
+## Observability
+
+Every request logs one structured JSON line (`src/observability/logger.ts`); phone
+numbers are masked (`***1234`) and names are never logged.
+
+| Event | Key fields |
+|---|---|
+| `webhook.dynamic_variables` | `telnyx_conversation_id`, masked caller, `system_status`, `booking_enabled`, `config_outcome` (`ok`/`stale`/`timeout`), `config_cached`, `latency_ms` |
+| `webhook.key_lookup_completed`, `webhook.rejected` | secret lookup time and cache hit; rejection reason |
+| `mcp.tool_call` | `tool`, `outcome` (`ok` or the error code), `latency_ms`, `telnyx_conversation_id` |
+| `mcp.rejected` | why an MCP request was refused (`missing_bearer`, `invalid_bearer`, `origin_header`, …) |
+| `callback.requested`, `portal.report_failed`, `portal.report_partial` | callback writes, portal failures with reason |
+
+Signals beyond logs:
+
+- **Counters and latency** per tool and outcome in the `Metrics` actor, shown live in
+  the portal's Observability tab.
+- **One trace id per call:** the same `telnyx_conversation_id` appears on the webhook
+  line and on every tool call, so a call can be followed Assistant → Function → KV /
+  Actors → MCP.
+
+### How we'd know within a minute that the assistant is broken
+
+1. **Portal → Observability** (refreshes every 10 s): status turns `degraded`,
+   webhook `degraded`/`rejected` counts rise, or a tool's error count grows.
+2. **Live logs:** `telnyx-edge logs servicedesk-ai --tail` — look for
+   `webhook.rejected`, `config_outcome` other than `ok`, `mcp.rejected`, or
+   `mcp.tool_call` with `outcome: service_unavailable`.
+3. **Platform metrics:** `telnyx-edge metrics servicedesk-ai --errors` for 5xx counts.
+
+**What to look at first:** the `webhook.dynamic_variables` line of the failing call.
+If it is missing or rejected, the assistant never got its variables (signature or
+key problem). If it says `degraded`, KV is slow or failing. If it is fine, follow its
+`telnyx_conversation_id` into the `mcp.tool_call` lines to find the failing tool.
+
+The bugs we found this way, with log evidence: [docs/debugging.md](docs/debugging.md).
 
 ## Operator portal
 
-`GET /portal` serves a single static page (React 18 from a pinned CDN, no
-build step) that holds no data. On load it asks once for the portal token
-(the `PORTAL_API_TOKEN` secret, bound as `PORTAL_AUTH`), keeps it in
-`sessionStorage`, and refreshes every 10 s from `GET /api/appointments`,
-`/api/kpis` and `/api/observability`. Those routes require
-`Authorization: Bearer <token>` (missing secret `503`, bad token `401`, wrong
-method `405`). Tabs:
+`/portal` is a single page with three tabs (the page holds no data; the `/api/*`
+endpoints require the portal token):
 
-- **Appointments** — bookings for today and the next 6 days (time, service,
-  name, phone) and the callback request queue.
-- **Business KPIs** — follow-up opportunities for the last 7 days: callers
-  who checked availability but did not book, booking requests we could not
-  serve, pending callbacks, and upcoming customers to remind about their next
-  service, plus bookings confirmed. Every figure comes from stored data.
-- **Observability** — system status, today's webhook counts and average
-  latency, per-tool calls/errors/latency, and the 50 most recent events.
+- **Appointments** — bookings for the next 7 days and recent callback requests.
+- **Business KPIs** — follow-up opportunities for a follow-up bot: callers who checked
+  availability but did not book, requests the shop could not serve, pending callbacks,
+  customers to re-contact for maintenance. Every number comes from stored data.
+- **Observability** — system status, webhook and per-tool counts and latency, and the
+  latest events with their conversation ids.
 
-Metrics come from a `Metrics` Actor per local day (`metrics-YYYY-MM-DD`)
-holding counters, latencies and conversation ids only, never customer data.
-Recording is best-effort with a 300 ms bound, so it never changes a webhook
-or tool result.
+## Development with Telnyx Inference (OpenCode)
 
-## Local commands
+OpenCode with the `@telnyx/opencode` plugin — config in
+[`.opencode/opencode.json`](.opencode/opencode.json).
+
+- **Models:** `zai-org/GLM-5.2` for the foundation and booking domain;
+  `MiniMaxAI/MiniMax-M3` for later, well-scoped tasks. The voice assistant itself runs
+  on `moonshotai/Kimi-K2.6`.
+- **What we learned:** the first ~$40 of inference went almost entirely to re-sending
+  context. One long session grew from ~10K to 516K tokens per request (98% cache hit,
+  ~700:1 input/output ratio). Switching to one short session per task and a cheaper
+  model cut the cost per request by roughly 15x for the same kind of work.
+- **Platform notes:** the plugin does not register model prices, so OpenCode shows
+  $0 while the account is being billed; the Telnyx dashboard was the only source of truth.
+
+## Setup
+
+Prerequisites: Node.js 20+, npm, the `telnyx-edge` CLI, and a Telnyx account.
 
 ```bash
 npm install
-npm run typecheck    # tsc --noEmit (strict mode) — 0 errors
-npm test             # vitest run (mocked)
+npm run typecheck     # strict TypeScript, 0 errors
+npm test              # Vitest, 600+ tests (mocked runtime)
 ```
 
-### Local runtime (verified historical probe)
-
-Requires Docker. Downloads ~1 GB on first run.
+Configure and deploy (the function is already registered in `telnyx.toml`):
 
 ```bash
-telnyx-edge dev --no-watch   # serves at http://127.0.0.1:8787
+telnyx-edge auth login
+telnyx-edge storage kv key put <kv-namespace-id> config/main --path config/main.json
+telnyx-edge secrets add MCP_API_TOKEN "<random>"        # bearer for /mcp
+telnyx-edge secrets add PORTAL_API_TOKEN "<random>"     # bearer for /api/*
+telnyx-edge secrets add SMOKE_TEST_TOKEN "<random>"     # bearer for /demo/*
+telnyx-edge secrets add TELNYX_PUBLIC_KEY "<account public key, base64>"
+telnyx-edge ship
 ```
 
-Local `dev` does not emulate `[[secrets]]` or `[storage.kv]` bindings, so
-auth-gated demo routes, `/mcp`, and the dynamic-variables webhook all fail
-closed (503) without bound credentials — exactly the behavior the mocked test
-suite exercises.
+Assistant configuration (Telnyx portal):
 
-```bash
-curl http://127.0.0.1:8787/health
-# → {"status":"ok","service":"servicedesk-ai"}
+1. **MCP server:** URL `…/mcp`, type HTTP, API key = an integration secret holding
+   `MCP_API_TOKEN`, tool timeout 10000 ms. Add it to the assistant.
+2. **Dynamic variables:** webhook URL `…/webhooks/dynamic-variables`, timeout 5000 ms,
+   defaults `booking_enabled = false`, `system_status = degraded`.
+3. **Workflow:** the nodes and edges above. MCP filler messages: "One moment while I
+   check that."
+
+## Repository layout
+
+```text
+src/
+  index.ts            entry point: exports the Actors, delegates to the router
+  http/               router, auth, body limits, webhook signature; routes/
+  mcp/                MCP server; tools/ has one file per tool
+  services/           availability, booking, portal reports (no HTTP)
+  domain/             pure rules: scheduling, config validation, booking coordinator
+  actors/             DayAgenda, ConversationBooking, DayCallbacks, Metrics
+  observability/      structured logger, bounded metric recording
+  portal/             operator portal page
+test/                 mirrors src/, plus integration/ and support/
+docs/                 architecture, debugging, verification, demo script
 ```
 
-Stop the stack:
+## Platform feedback
 
-```bash
-docker compose -f .telnyx/dev/compose.yaml down        # stop (keeps state)
-docker compose -f .telnyx/dev/compose.yaml down -v      # stop + delete state
-```
+Found while building, with evidence in [docs/debugging.md](docs/debugging.md):
 
-## Deployed function and recorded public URL
+- A newly registered actor type (`CallbackQueue`) showed `ready` but every invocation
+  failed with `failed to lookup actor`; a fresh type name worked.
+- `telnyx-edge ship` adds new actor bindings but does not remove ones deleted from
+  `telnyx.toml`, so `actors delete` keeps refusing with "still bound".
+- Secret reads take ~560–710 ms on a cold instance, against a 1.5 s default webhook timeout.
+- MCP tools cannot be scoped per workflow node in the portal.
+- The portal MCP form reports `api_key_ref` errors without saying the token must be
+  an integration secret.
+- Trial accounts can only search Mexico local numbers, which were out of stock.
 
-`telnyx.toml` already contains the registered `func_id` from
-`telnyx-edge new-func --actor` (recorded 2026-10-16). Do not re-register;
-re-running `new-func` would provision a new function.
+## Known limitations
 
-Recorded public URL (subtasks 1.5.4, 1.5.5, 2.2d, 2.3e, 2.4d, 3.1b, 3.3 in
-`docs/verification.md`):
-
-```
-https://servicedesk-ai-a666861a-1.telnyxcompute.com
-```
-
-All recorded remote checks happened against this URL. The three MCP tools,
-the `/demo/*` route set (config / availability / bookings), and the public
-boundaries all have recorded deployment evidence (see `docs/verification.md`
-subtasks 1.5.4, 1.5.5, 2.2d, 2.3e, 2.4d, 3.1b, 3.3). The 2026-10-16 subtask
-3.3 evidence refers to the old content-derived key
-(`sha256(phone|date|time|service_id)`) and is preserved as historical, not as
-proof of the conversation-Actor implementation. The 2026-10-17 ship
-(subtask 5.x in `docs/verification.md`) deployed the
-`dynamic-variables` webhook with Ed25519 signature verification and the
-`ConversationBooking` Actor routing that replaced the old content-derived
-MCP idempotency key; that subtask also records the unauthenticated remote
-checks performed against the live URL.
-
-## Secret bindings (separate, never recorded)
-
-`telnyx.toml` declares two independent secret bindings so revocation scopes to
-one surface:
-
-- `[[secrets]] SMOKE_AUTH = "SMOKE_TEST_TOKEN"` — protects `/demo/*`.
-- `[[secrets]] MCP_AUTH = "MCP_API_TOKEN"` — protects `/mcp`.
-- `[[secrets]] WEBHOOK_PUBLIC_KEY = "TELNYX_PUBLIC_KEY"` — Ed25519 public key
-  (base64, 32 bytes) used to verify the `telnyx-signature-ed25519` header on
-  `/webhooks/dynamic-variables`. The matching private key lives in Mission
-  Control; this repo never sees it.
-
-Token values are never committed, logged, or echoed in responses. Before remote
-smoke tests:
-
-```bash
-telnyx-edge secrets add SMOKE_TEST_TOKEN "<random-value>"
-telnyx-edge secrets add MCP_API_TOKEN    "<random-value>"
-```
-
-Failure modes (intentionally distinct):
-
-- `/demo/*` infrastructure failure (binding absent, secret empty/throws,
-  invalid config, Actor error) → HTTP `503 { error: "service_unavailable" }`.
-- `/mcp` auth failure (binding absent, secret empty/throws) → HTTP `503
-  { error: "service_unavailable" }`. Missing or wrong `Authorization` → `401`.
-- `/mcp` tool-execution infrastructure failure (KV read throws, missing
-  binding reached the handler, Actor throws) → `200` with an
-  `isError: true` MCP tool result (the JSON-RPC envelope stays valid; the
-  tool result text is `service_unavailable` or the domain error code).
-- `/webhooks/dynamic-variables` KV wait timeout / load failure / absent
-  binding → HTTP `200` with `system_status: "degraded"` and
-  `booking_enabled: "false"` (never blocks the caller). Missing / malformed
-  / late `WEBHOOK_PUBLIC_KEY` lookup or `crypto.subtle` failure → HTTP
-  `503 { error: "service_unavailable" }`; unverified signature → HTTP
-  `401 { error: "unauthorized" }`.
-
-## Logging and PII
-
-The webhook logs a masked phone suffix (`***NNNN`) for correlation; no customer
-names or full phone numbers are logged or returned in any response on any
-route.
-
-## Pending (not implemented)
-
-- Voice AI Assistant / Conversation Workflow / phone-number integration.
-- Monitoring, alerts, and an operations portal.
-
-## Official source URLs
-
-- [Edge Compute CLI (GitHub)](https://github.com/team-telnyx/edge-compute)
-- [Runtime overview](https://developers.telnyx.com/docs/edge-compute/runtime/index)
-- [HTTP handler contract](https://developers.telnyx.com/docs/edge-compute/runtime/http-handler)
-- [Bindings](https://developers.telnyx.com/docs/edge-compute/runtime/bindings)
-- [Stateful Actors](https://developers.telnyx.com/docs/edge-compute/stateful-actors)
-- [Actor Quick Start](https://developers.telnyx.com/docs/edge-compute/stateful-actors/quick-start)
-- [Actor Project Structure](https://developers.telnyx.com/docs/edge-compute/stateful-actors/guides/project-structure)
-- [Actor API Reference](https://developers.telnyx.com/docs/edge-compute/stateful-actors/api-reference)
+- Reached by web call: the trial account had no purchasable phone number (see the table at the top).
+- No cancel/reschedule tool: changes go through a callback request.
+- Callback requests are stored and visible to staff; there is no automatic call-back.
