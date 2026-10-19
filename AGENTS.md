@@ -26,15 +26,17 @@ telnyx-edge types    # regenerate telnyx-env.d.ts from manifest
 
 - `telnyx.toml` — umbrella manifest (actors, KV, secrets bindings)
 - `telnyx-env.d.ts` — generated types (DO NOT EDIT)
-- `src/index.ts` — fetch handler entrypoint, route dispatch
-- `src/config.ts` — KV config loader with runtime validation
-- `src/scheduling.ts` — pure scheduling domain (dates, slots, timezone, window)
-- `src/agenda-actor.ts` — `DayAgenda` StatefulActor (occupancy read + booking write)
-- `src/availability.ts` — availability service (scheduling + Actor occupancy)
-- `src/bookings.ts` — HTTP booking adapter (body limits, structural validation, Actor routing)
-- `src/counter.ts` — demo Counter actor (platform probe)
+- `src/index.ts` — entrypoint: exports the Actor classes and delegates to the router
+- `src/env.ts` — the bindings the fetch handler receives
+- `src/http/` — router, bearer auth, bounded body reader, webhook signature; `routes/` holds the webhook, MCP, portal and `/demo/*` handlers
+- `src/mcp/` — MCP server; `tools/` has one file per tool
+- `src/app/` — transport-independent use cases (availability, booking service, portal reports)
+- `src/domain/` — pure rules: business rules, scheduling, config validation, conversation booking coordinator
+- `src/actors/` — Stateful Actors (DayAgenda, ConversationBooking, CallbackQueue, Metrics, Counter) and their typed bindings
+- `src/observability/` — structured logger and bounded metric recording
+- `src/portal/` — operator portal HTML page
 - `config/main.json` — non-sensitive demo seed configuration
-- `test/` — Vitest test suite (all mocked; no real runtime)
+- `test/` — Vitest suite mirroring `src/` folders, plus `integration/` and `support/`
 - `docs/` — architecture, verification, debugging, booking-domain spec
 - `scripts/` — remote verification scripts
 

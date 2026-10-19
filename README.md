@@ -85,8 +85,8 @@ Ed25519 public key stored in the `WEBHOOK_PUBLIC_KEY` secret binding
 enforces a ±300 s replay window. A missing or slow secret lookup, a malformed
 key, or an `invalid_configuration` from `crypto.subtle` fails closed with
 `503 { error: "service_unavailable" }`; an unverified signature returns
-`401 { error: "unauthorized" }`. See `src/webhook-signature.ts` and
-`src/dynamic-variables.ts`.
+`401 { error: "unauthorized" }`. See `src/http/webhook-signature.ts` and
+`src/http/routes/dynamic-variables.ts`.
 
 ## Operator portal
 

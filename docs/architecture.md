@@ -12,7 +12,7 @@ integration, monitoring, and the operations portal) is **planned, not
 implemented** in this repo. The HTTP and MCP adapters are the only entry
 points today.
 
-## HTTP routes (`src/index.ts`)
+## HTTP routes (`src/http/router.ts`)
 
 | Route | Auth | Purpose |
 |---|---|---|
@@ -47,7 +47,7 @@ phone numbers are logged or returned in any response on any route; the
 dynamic-variables webhook retains only a masked phone suffix (`***NNNN`) for
 correlation.
 
-## MCP tools (`src/mcp-server.ts`)
+## MCP tools (`src/mcp/`)
 
 Three tools, each registered on a fresh `McpServer` per request (no shared
 session state):
@@ -71,7 +71,7 @@ session state):
   `conversation_already_booked`; identical replays return the original
   result. Customer PII never leaves the boundary in any response.
 
-## Dynamic-variables webhook (`src/dynamic-variables.ts`)
+## Dynamic-variables webhook (`src/http/routes/dynamic-variables.ts`)
 
 Answers Telnyx Assistant init with a small `dynamic_variables` payload
 (`booking_enabled`, `system_status`, `today_local`, `today_weekday`,
@@ -79,7 +79,7 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
 
 - **Ed25519 signature verification.** Every delivery is verified before the
   JSON body is parsed or KV is touched. `verifyWebhookSignature()`
-  (`src/webhook-signature.ts`) is a pure function: given the raw body, the
+  (`src/http/webhook-signature.ts`) is a pure function: given the raw body, the
   request headers, the base64 public key, and `Date.now()`, it returns
   `valid` / `invalid_signature` / `invalid_configuration`. The signed payload
   is `${timestampHeader}|${rawBody}` and the timestamp is checked against a
@@ -111,14 +111,14 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
 
 ## Adapters and the booking-service
 
-`src/booking-service.ts` is a transport-independent application service:
+`src/app/booking-service.ts` is a transport-independent application service:
 trusted `loadConfig`, Actor lookup by name (`agendaActorName(locationId, date)`
 → e.g. `main-2026-10-20`), response-shape validation, and a typed outcome.
 
-- `src/bookings.ts` (`POST /demo/bookings`) — HTTP adapter: bounded body
+- `src/http/routes/bookings.ts` (`POST /demo/bookings`) — HTTP adapter: bounded body
   reader (10 KiB), structural validation, dependency wiring, response
   mapping. **No business admission** — all rules live in the Actor.
-- `src/mcp-server.ts` (`create_booking` tool) — MCP adapter: Zod-strict
+- `src/mcp/tools/create-booking.ts` (`create_booking` tool) — MCP adapter: Zod-strict
   input, conversation metadata extracted from `params._meta`,
   `conversationActorName(id) = "conversation-${sha256(id)}"` for stable
   Actor routing, conversation-Actor result validation
@@ -134,7 +134,7 @@ path adds the conversation Actor on top, so one confirmed booking per
 conversation is enforced in addition to the per-slot
 `DayAgenda` admission.
 
-## Stateful Actor — `DayAgenda` (`src/agenda-actor.ts`)
+## Stateful Actor — `DayAgenda` (`src/actors/day-agenda.ts`)
 
 - One instance **per `location_id` per `YYYY-MM-DD`**, addressed as
   `main-2026-10-20`. Owns authoritative occupancy + idempotency for that day.
@@ -149,7 +149,7 @@ conversation is enforced in addition to the per-slot
 The Actor owns admission and persistence; the application service and
 adapters do no business validation.
 
-## Stateful Actor — `ConversationBooking` (`src/conversation-actor.ts`)
+## Stateful Actor — `ConversationBooking` (`src/actors/conversation-booking.ts`)
 
 - One instance **per trusted Telnyx conversation**, addressed as
   `conversation-${sha256(telnyx_conversation_id)}`. Owns the
@@ -162,7 +162,7 @@ adapters do no business validation.
   pending before execution, and only writes `confirmed` or `idle` after the
   executor result is validated. The executor path loads trusted `loadConfig`
   and routes to `DayAgenda.idFromName(...)` (`createBooking()` in
-  `src/booking-service.ts`).
+  `src/app/booking-service.ts`).
 - The Actor owns attempt-key stability and conversation-scoped state; the
   MCP layer never consults KV or AGENDA before calling. RPC callers never
   supply config, location, attempt key, or credentials; the adapter injects
@@ -172,7 +172,7 @@ adapters do no business validation.
 persistence. The two Actor types do **not** share a transaction or an
 exactly-once delivery guarantee.
 
-## KV config (`src/config.ts`)
+## KV config (`src/domain/config.ts`)
 
 `loadConfig(kv)` reads `config/main` as JSON and validates at runtime
 (non-empty service IDs, unique, 60-minute durations, real boolean
