@@ -4,7 +4,7 @@ import {
   createBooking as createBookingService,
   type BookingRequest,
   type BookingServiceResult,
-} from "../../app/booking-service";
+} from "../../services/booking";
 import type { Env } from "../../env";
 import { readBoundedBody } from "../body";
 

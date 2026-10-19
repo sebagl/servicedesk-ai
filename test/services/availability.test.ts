@@ -16,7 +16,7 @@ import {
   getAvailability,
   validateDateParam,
   type AvailabilityResult,
-} from "../../src/app/availability";
+} from "../../src/services/availability";
 import type { AppConfig } from "../../src/domain/config";
 
 const VALID_TOKEN = "test-smoke-token-value";

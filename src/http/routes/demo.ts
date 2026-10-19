@@ -1,5 +1,5 @@
-import { getAvailability, validateDateParam } from "../../app/availability";
-import { loadCallbacks } from "../../app/portal-reports";
+import { getAvailability, validateDateParam } from "../../services/availability";
+import { loadCallbacks } from "../../services/portal-reports";
 import { loadConfig, type AppConfig } from "../../domain/config";
 import type { Env } from "../../env";
 import { logEvent } from "../../observability/logger";

@@ -111,9 +111,9 @@ Answers Telnyx Assistant init with a small `dynamic_variables` payload
   names or full phone numbers are logged; raw request bodies, header
   values, and unvalidated identifiers are never logged.
 
-## Adapters and the booking-service
+## Adapters and the booking service
 
-`src/app/booking-service.ts` is a transport-independent application service:
+`src/services/booking.ts` is a transport-independent application service:
 trusted `loadConfig`, Actor lookup by name (`agendaActorName(locationId, date)`
 → e.g. `main-2026-10-20`), response-shape validation, and a typed outcome.
 
@@ -178,7 +178,7 @@ adapters do no business validation.
   pending before execution, and only writes `confirmed` or `idle` after the
   executor result is validated. The executor path loads trusted `loadConfig`
   and routes to `DayAgenda.idFromName(...)` (`createBooking()` in
-  `src/app/booking-service.ts`).
+  `src/services/booking.ts`).
 - The Actor owns attempt-key stability and conversation-scoped state; the
   MCP layer never consults KV or AGENDA before calling. RPC callers never
   supply config, location, attempt key, or credentials; the adapter injects
@@ -198,7 +198,7 @@ and the failure modes obvious.
 | Storage | Holds | Why here | Examples |
 |---|---|---|---|
 | **KV** (`config` namespace) | Service catalog + business config + `booking_enabled` | Read-mostly, owner-tunable without redeploy. Never holds transactional state. | `services[].id`, `slot_hours`, `booking_enabled` |
-| **Function logic** (`src/domain/*`, `src/app/*`) | Stateless validation and scheduling | Pure rules; no per-entity ownership; can be re-exercised without coordination. | `isDateInWindow`, `isSlotPast`, `validateSlotRequest`, `computeKpis`, `loadConfig` |
+| **Function logic** (`src/domain/*`, `src/services/*`) | Stateless validation and scheduling | Pure rules; no per-entity ownership; can be re-exercised without coordination. | `isDateInWindow`, `isSlotPast`, `validateSlotRequest`, `computeKpis`, `loadConfig` |
 | **Actor** (per-entity) | One authoritative aggregate per entity | Per-entity read-modify-write that must be serialized. Single `put`, no shared transaction with other Actors. | `DayAgenda` (one per `location-day`, owns check-and-book), `ConversationBooking` (one per `telnyx_conversation_id`, owns one-booking-per-conversation), `DayCallbacks` (one per local day, owns the day's callback list), `Metrics` (one per local day, owns per-day counters and latency) |
 
 ## KV config (`src/domain/config.ts`)

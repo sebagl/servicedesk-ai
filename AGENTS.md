@@ -30,7 +30,7 @@ telnyx-edge types    # regenerate telnyx-env.d.ts from manifest
 - `src/env.ts` — the bindings the fetch handler receives
 - `src/http/` — router, bearer auth, bounded body reader, webhook signature; `routes/` holds the webhook, MCP, portal and `/demo/*` handlers
 - `src/mcp/` — MCP server; `tools/` has one file per tool
-- `src/app/` — transport-independent use cases (availability, booking service, portal reports)
+- `src/services/` — transport-independent application services (availability, booking, portal reports)
 - `src/domain/` — pure rules: business rules, scheduling, config validation, conversation booking coordinator
 - `src/actors/` — Stateful Actors (DayAgenda, ConversationBooking, DayCallbacks, Metrics) and their typed bindings
 - `src/observability/` — structured logger and bounded metric recording

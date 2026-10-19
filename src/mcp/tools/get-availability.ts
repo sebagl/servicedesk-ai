@@ -3,7 +3,7 @@ import type { KvNamespace } from "@telnyx/edge-runtime";
 import { z } from "zod";
 
 import type { AgendaNamespace } from "../../actors/bindings";
-import { getAvailability } from "../../app/availability";
+import { getAvailability } from "../../services/availability";
 import { loadConfig } from "../../domain/config";
 import { isValidDate } from "../../domain/scheduling";
 import { startToolCall, toolError, toolJson, type ToolContext } from "../tool-result";

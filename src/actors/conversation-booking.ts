@@ -6,7 +6,7 @@ import type { AgendaNamespace } from "./bindings";
 import {
   createBooking,
   type BookingServiceResult,
-} from "../app/booking-service";
+} from "../services/booking";
 import {
   coordinateBooking,
   type ActorStorageLike,

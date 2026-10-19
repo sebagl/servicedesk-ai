@@ -14,7 +14,7 @@ import {
   getAppointmentsReport,
   getKpisReport,
   type DayBookings,
-} from "../../src/app/portal-reports";
+} from "../../src/services/portal-reports";
 import { emptySnapshot, type MetricsSnapshot } from "../../src/actors/metrics";
 import { addDays, getLocalDateString } from "../../src/domain/scheduling";
 import { callbacksActorName } from "../../src/domain/business-rules";

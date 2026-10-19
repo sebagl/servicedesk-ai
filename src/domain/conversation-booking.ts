@@ -1,7 +1,7 @@
 import type {
   BookingDomainError,
   BookingServiceResult,
-} from "../app/booking-service";
+} from "../services/booking";
 
 // ---------------------------------------------------------------------------
 // Conversation-scoped booking coordinator (booking-domain.md §10).

@@ -3,7 +3,7 @@ import {
   getKpisReport,
   getObservabilityReport,
   type PortalDeps,
-} from "../../app/portal-reports";
+} from "../../services/portal-reports";
 import type { Env } from "../../env";
 import { logEvent } from "../../observability/logger";
 import { PORTAL_HTML } from "../../portal/page";

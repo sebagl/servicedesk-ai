@@ -6,7 +6,7 @@ import {
   type BookingAgendaLike,
   type BookingServiceDeps,
   type BookingDomainError,
-} from "../../src/app/booking-service";
+} from "../../src/services/booking";
 import type { AppConfig } from "../../src/domain/config";
 import type { CreateBookingResult } from "../../src/actors/day-agenda";
 
