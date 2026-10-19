@@ -180,7 +180,7 @@ function mcpEnv(metrics?: MetricsNamespace, extra: Record<string, unknown> = {})
 }
 
 describe("MCP tool results are unaffected by metrics failures", () => {
-  const callbackQueue = () => ({
+  const dayCallbacks = () => ({
     idFromName: () => ({
       requestCallback: vi.fn(async () => ({ request_id: "req-1", created_at: "2026-10-18T10:00:00.000Z" })),
     }),
@@ -201,7 +201,7 @@ describe("MCP tool results are unaffected by metrics failures", () => {
       const args = { customer_name: CUSTOMER_NAME, customer_phone: CUSTOMER_PHONE, reason: "pricing" };
       const res = await handler.fetch(
         mcpCall("request_callback", args, "conv-1"),
-        mcpEnv(factory(), { CALLBACK_QUEUE: callbackQueue() }),
+        mcpEnv(factory(), { DAY_CALLBACKS: dayCallbacks() }),
       );
       const body = (await res.json()) as { result: { content: Array<{ text: string }> } };
       expect(JSON.parse(body.result.content[0]!.text)).toEqual({ status: "recorded", request_id: "req-1" });
@@ -211,7 +211,7 @@ describe("MCP tool results are unaffected by metrics failures", () => {
   it("records tool outcomes and callback.requested without customer data", async () => {
     const { ns, record } = capturingMetrics();
     const args = { customer_name: CUSTOMER_NAME, customer_phone: CUSTOMER_PHONE, reason: "pricing" };
-    await handler.fetch(mcpCall("request_callback", args, "conv-1"), mcpEnv(ns, { CALLBACK_QUEUE: callbackQueue() }));
+    await handler.fetch(mcpCall("request_callback", args, "conv-1"), mcpEnv(ns, { DAY_CALLBACKS: dayCallbacks() }));
     const inputs = record.mock.calls.map((c) => c[0]);
     expect(inputs).toContainEqual({ event: "callback", outcome: "requested", telnyx_conversation_id: "conv-1" });
     expect(inputs).toContainEqual(

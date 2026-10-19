@@ -22,3 +22,7 @@ export const SLOT_START_TIMES: readonly string[] = Array.from(
 export function agendaActorName(locationId: string, date: string): string {
   return `${locationId}-${date}`;
 }
+
+export function callbacksActorName(date: string): string {
+  return `callbacks-${date}`;
+}

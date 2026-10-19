@@ -5,6 +5,7 @@ import {
   type PortalDeps,
 } from "../../app/portal-reports";
 import type { Env } from "../../env";
+import { logEvent } from "../../observability/logger";
 import { PORTAL_HTML } from "../../portal/page";
 import { getPortalToken, hasValidBearer } from "../auth";
 
@@ -53,13 +54,20 @@ export async function handlePortal(req: Request, env: Env, pathname: string): Pr
       {
         config: env.CONFIG,
         agenda: env.AGENDA,
-        callbackQueue: env.CALLBACK_QUEUE,
+        dayCallbacks: env.DAY_CALLBACKS,
         metrics: env.METRICS,
       },
       Date.now(),
     );
-    return body === null ? unavailable() : Response.json(body);
-  } catch {
+    if (body === null) {
+      logEvent("portal.report_failed", { route: pathname, reason: "binding_missing" });
+      return unavailable();
+    }
+    return Response.json(body);
+  } catch (err) {
+    // Error messages from the Actors carry no customer data; truncated anyway.
+    const reason = err instanceof Error ? `${err.name}: ${err.message}` : "unknown";
+    logEvent("portal.report_failed", { route: pathname, reason: reason.slice(0, 160) });
     return unavailable();
   }
 }

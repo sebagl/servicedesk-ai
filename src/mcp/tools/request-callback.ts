@@ -1,7 +1,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import type { CallbackQueueNamespace } from "../../actors/bindings";
+import type { DayCallbacksNamespace } from "../../actors/bindings";
+import { callbacksActorName } from "../../domain/business-rules";
+import { getLocalDateString } from "../../domain/scheduling";
 import { logEvent, maskPhone } from "../../observability/logger";
 import { recordMetric } from "../../observability/metrics";
 import { startToolCall, toolError, toolJson, type ToolContext } from "../tool-result";
@@ -14,16 +16,12 @@ const INPUT = z
   })
   .strict();
 
-// Single shared instance, so every request goes through one coherent
-// read-modify-write of the queue.
-const CALLBACK_QUEUE_ACTOR_NAME = "main";
-
 // `request_callback` — write path. Records a callback request for the team,
-// idempotent per conversation. Name and phone are stored inside the Actor
-// but never echoed back in the response.
+// idempotent per conversation within the local day. Name and phone are
+// stored inside the Actor but never echoed back in the response.
 export function registerRequestCallback(
   server: McpServer,
-  callbackQueue: CallbackQueueNamespace | undefined,
+  dayCallbacks: DayCallbacksNamespace | undefined,
   ctx: ToolContext,
 ): void {
   server.registerTool(
@@ -37,16 +35,18 @@ export function registerRequestCallback(
       const start = Date.now();
       const { conversationId, done } = startToolCall("request_callback", ctx, extra);
       if (conversationId === undefined) return done(toolError("conversation_id_required"));
-      if (callbackQueue === undefined) return done(toolError());
+      if (dayCallbacks === undefined) return done(toolError());
 
       let raw: { request_id?: unknown; created_at?: unknown };
       try {
-        raw = await callbackQueue.idFromName(CALLBACK_QUEUE_ACTOR_NAME).requestCallback({
-          conversation_id: conversationId,
-          customer_name: args.customer_name,
-          customer_phone: args.customer_phone,
-          reason: args.reason,
-        });
+        raw = await dayCallbacks
+          .idFromName(callbacksActorName(getLocalDateString(Date.now())))
+          .requestCallback({
+            conversation_id: conversationId,
+            customer_name: args.customer_name,
+            customer_phone: args.customer_phone,
+            reason: args.reason,
+          });
       } catch {
         return done(toolError());
       }

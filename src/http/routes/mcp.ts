@@ -43,7 +43,7 @@ export async function handleMcp(req: Request, env: Env): Promise<Response> {
     config: env.CONFIG,
     agenda: env.AGENDA,
     conversationBooking: env.CONVERSATION_BOOKING,
-    callbackQueue: env.CALLBACK_QUEUE,
+    dayCallbacks: env.DAY_CALLBACKS,
     callId: readCallId(req),
     metrics: env.METRICS,
   });

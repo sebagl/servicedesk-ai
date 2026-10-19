@@ -85,8 +85,9 @@ export const PORTAL_HTML = `<!doctype html>
             rows=\${day.bookings.map(function (b) { return [b.time, b.service_id, b.customer_name, b.customer_phone]; })} /></section>\`;
       })}
       <h2>Callback requests</h2>
+      \${d.callbacks_ok ? null : html\`<p class="bad">Callback requests unavailable</p>\`}
       <\${Table} cols=\${["Time", "Name", "Phone", "Reason"]} empty="No callback requests."
-        rows=\${d.callbacks.map(function (c) { return [time(c.created_at), c.customer_name, c.customer_phone, c.reason]; })} />
+        rows=\${d.callbacks_ok ? d.callbacks.map(function (c) { return [time(c.created_at), c.customer_name, c.customer_phone, c.reason]; }) : []} />
     </div>\`;
   }
 

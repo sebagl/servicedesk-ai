@@ -16,7 +16,7 @@ import type {
 import type {
   CallbackRequestInput,
   CallbackRequestResult,
-} from "../../src/actors/callback-queue";
+} from "../../src/actors/day-callbacks";
 
 const VALID_TOKEN = "mcp-test-token-value";
 
@@ -517,7 +517,7 @@ describe("/mcp — two independent requests have no shared transport state", () 
   });
 
   it("GET /health still 200 (no /mcp side effects on existing routes)", async () => {
-    const env = { COUNTER: { idFromName: () => ({ increment: vi.fn(), read: vi.fn() }) } };
+    const env = {};
     const res = await handler.fetch(
       new Request("http://x/health"),
       env as never,
@@ -1891,8 +1891,11 @@ describe("/mcp — MCP_AUTH cache", () => {
 });
 
 // ---------------------------------------------------------------------------
-// request_callback — single shared CallbackQueue StatefulActor
+// request_callback — per-day DayCallbacks StatefulActor
 // ---------------------------------------------------------------------------
+
+import { callbacksActorName } from "../../src/domain/business-rules";
+import { getLocalDateString } from "../../src/domain/scheduling";
 
 describe("/mcp — tools/call request_callback", () => {
   type CallbackHandler = (
@@ -1950,7 +1953,7 @@ describe("/mcp — tools/call request_callback", () => {
     });
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       CALLBACK_ARGS(),
       { telnyx_conversation_id: "conv-cb-1" },
@@ -1972,7 +1975,7 @@ describe("/mcp — tools/call request_callback", () => {
     expect(parsed).toEqual({ status: "recorded", request_id: "req-1" });
 
     expect(idFromName).toHaveBeenCalledTimes(1);
-    expect(idFromName).toHaveBeenCalledWith("main");
+    expect(idFromName).toHaveBeenCalledWith(callbacksActorName(getLocalDateString(Date.now())));
     expect(stub.requestCallback).toHaveBeenCalledTimes(1);
 
     expect(captured).toHaveLength(1);
@@ -1998,7 +2001,7 @@ describe("/mcp — tools/call request_callback", () => {
       }),
     };
     const idFromName = vi.fn(() => stub);
-    const env = { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } };
+    const env = { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } };
 
     const r1 = await callRequestCallback(
       env,
@@ -2036,7 +2039,7 @@ describe("/mcp — tools/call request_callback", () => {
       }),
     };
     const idFromName = vi.fn(() => stub);
-    const env = { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } };
+    const env = { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } };
 
     const r1 = await callRequestCallback(
       env,
@@ -2069,7 +2072,7 @@ describe("/mcp — tools/call request_callback", () => {
     }));
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       CALLBACK_ARGS(),
     );
@@ -2093,7 +2096,7 @@ describe("/mcp — tools/call request_callback", () => {
     }));
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       CALLBACK_ARGS(),
       { telnyx_conversation_id: "has space and !chars" },
@@ -2110,7 +2113,7 @@ describe("/mcp — tools/call request_callback", () => {
     expect(stub.requestCallback).not.toHaveBeenCalled();
   });
 
-  it("absent CALLBACK_QUEUE binding → service_unavailable, no infra call", async () => {
+  it("absent DAY_CALLBACKS binding → service_unavailable, no infra call", async () => {
     const res = await callRequestCallback(
       { SECRETS: validSecrets() },
       1,
@@ -2133,7 +2136,7 @@ describe("/mcp — tools/call request_callback", () => {
     });
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       CALLBACK_ARGS(),
       { telnyx_conversation_id: "conv-cb-throw" },
@@ -2157,7 +2160,7 @@ describe("/mcp — tools/call request_callback", () => {
     );
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       CALLBACK_ARGS(),
       { telnyx_conversation_id: "conv-cb-badshape" },
@@ -2178,7 +2181,7 @@ describe("/mcp — tools/call request_callback", () => {
     }));
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       { ...CALLBACK_ARGS(), confirmed: true },
       { telnyx_conversation_id: "conv-cb-strict" },
@@ -2200,7 +2203,7 @@ describe("/mcp — tools/call request_callback", () => {
     }));
 
     const res = await callRequestCallback(
-      { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+      { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
       1,
       {
         customer_name: "Alice Smith",
@@ -2258,7 +2261,7 @@ describe("/mcp — tools/call request_callback", () => {
       }));
 
       await callRequestCallback(
-        { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+        { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
         1,
         {
           customer_name: "Alice Smith",
@@ -2291,7 +2294,7 @@ describe("/mcp — tools/call request_callback", () => {
       });
 
       await callRequestCallback(
-        { SECRETS: validSecrets(), CALLBACK_QUEUE: { idFromName } },
+        { SECRETS: validSecrets(), DAY_CALLBACKS: { idFromName } },
         1,
         CALLBACK_ARGS(),
         { telnyx_conversation_id: "conv-cb-fail" },

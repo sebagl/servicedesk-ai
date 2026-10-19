@@ -91,7 +91,6 @@ function makeEnv(
   config: { get: ReturnType<typeof vi.fn> },
 ): unknown {
   return {
-    COUNTER: { idFromName: () => ({}) },
     AGENDA: agenda,
     SECRETS: secrets,
     CONFIG: config,
@@ -601,7 +600,6 @@ describe("GET /demo/availability (HTTP route)", () => {
 
     it("503 for missing AGENDA binding", async () => {
       const env = {
-        COUNTER: { idFromName: () => ({}) },
         SECRETS: validSecrets(),
         CONFIG: validKv(VALID_CONFIG),
       };
@@ -614,7 +612,6 @@ describe("GET /demo/availability (HTTP route)", () => {
 
     it("503 for missing CONFIG binding", async () => {
       const env = {
-        COUNTER: { idFromName: () => ({}) },
         AGENDA: { idFromName: vi.fn(() => ({ getOccupiedSlots: vi.fn() })) },
         SECRETS: validSecrets(),
       };

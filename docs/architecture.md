@@ -22,7 +22,7 @@ points today.
 | `GET /demo/config` | `SMOKE_AUTH` bearer (`SMOKE_TEST_TOKEN`) | Returns validated KV config |
 | `GET /demo/availability?date=YYYY-MM-DD` | `SMOKE_AUTH` | Slots for one date with Actor occupancy |
 | `POST /demo/bookings` | `SMOKE_AUTH` | Create one booking (delegates to `DayAgenda`) |
-| `POST\|GET /demo/counter/:id/{increment,read}` | `SMOKE_AUTH` | Platform probe (Counter actor) |
+| `GET /demo/callbacks` | `SMOKE_AUTH` | Pending callback requests across the last 7 local days, merged newest first |
 
 Failure modes (intentionally distinct across surfaces):
 
@@ -149,6 +149,20 @@ conversation is enforced in addition to the per-slot
 The Actor owns admission and persistence; the application service and
 adapters do no business validation.
 
+## Stateful Actor — `DayCallbacks` (`src/actors/day-callbacks.ts`)
+
+- One instance **per local calendar date**, addressed as
+  `callbacks-2026-10-20`. Persists the newest 200 callback requests in a
+  single `"queue"` key, newest first.
+- `requestCallback(input)` (write) — per-conversation idempotent inside the
+  day; a repeat from the same conversation returns the original entry. Name
+  and phone are stored inside the Actor but never returned by the API
+  surface.
+- `listCallbacks()` (read) — returns the day's entries in stored order.
+- The operator listing (`/demo/callbacks` and the portal) merges the last 7
+  local days (today + 6 previous) — fixed actor names, no scans — and sorts
+  the merged set newest first.
+
 ## Stateful Actor — `ConversationBooking` (`src/actors/conversation-booking.ts`)
 
 - One instance **per trusted Telnyx conversation**, addressed as
@@ -171,6 +185,19 @@ adapters do no business validation.
 `DayAgenda` remains the authoritative owner of slot occupancy and booking
 persistence. The two Actor types do **not** share a transaction or an
 exactly-once delivery guarantee.
+
+## Why Actor vs KV vs function
+
+Stateful Actors and KV both persist, but they answer different questions. A
+function call is stateless; an Actor holds one aggregate; KV is a flat key
+space. Picking the right one keeps each component's responsibilities narrow
+and the failure modes obvious.
+
+| Storage | Holds | Why here | Examples |
+|---|---|---|---|
+| **KV** (`config` namespace) | Service catalog + business config + `booking_enabled` | Read-mostly, owner-tunable without redeploy. Never holds transactional state. | `services[].id`, `slot_hours`, `booking_enabled` |
+| **Function logic** (`src/domain/*`, `src/app/*`) | Stateless validation and scheduling | Pure rules; no per-entity ownership; can be re-exercised without coordination. | `isDateInWindow`, `isSlotPast`, `validateSlotRequest`, `computeKpis`, `loadConfig` |
+| **Actor** (per-entity) | One authoritative aggregate per entity | Per-entity read-modify-write that must be serialized. Single `put`, no shared transaction with other Actors. | `DayAgenda` (one per `location-day`, owns check-and-book), `ConversationBooking` (one per `telnyx_conversation_id`, owns one-booking-per-conversation), `DayCallbacks` (one per local day, owns the day's callback list), `Metrics` (one per local day, owns per-day counters and latency) |
 
 ## KV config (`src/domain/config.ts`)
 
@@ -201,7 +228,7 @@ reach infrastructure.
 ## What's verified vs. what isn't
 
 **Verified — local mocked tests** (`npm run typecheck` 0 errors, `npm test`
-510/510 passing across 14 files):
+passing):
 
 - HTTP routing, method handling, and 404 behavior for every route.
 - Full auth gate: absent/empty/rejecting secret → `503`; missing/malformed/

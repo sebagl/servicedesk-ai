@@ -4,8 +4,8 @@ import type { KvNamespace } from "@telnyx/edge-runtime";
 
 import type {
   AgendaNamespace,
-  CallbackQueueNamespace,
   ConversationBookingNamespace,
+  DayCallbacksNamespace,
   MetricsNamespace,
 } from "../actors/bindings";
 import type { ToolContext } from "./tool-result";
@@ -20,7 +20,7 @@ export interface McpDeps {
   config?: KvNamespace;
   agenda?: AgendaNamespace;
   conversationBooking?: ConversationBookingNamespace;
-  callbackQueue?: CallbackQueueNamespace;
+  dayCallbacks?: DayCallbacksNamespace;
   // Optional caller-supplied correlation id (e.g. the Telnyx call_control_id
   // forwarded as a header), logged so a call can be traced across webhook
   // and tool calls. Never used for authorization or business logic.
@@ -42,7 +42,7 @@ export async function handleMcpRequest(req: Request, deps: McpDeps): Promise<Res
   registerGetServiceCatalog(server, deps.config, ctx);
   registerGetAvailability(server, deps.config, deps.agenda, ctx);
   registerCreateBooking(server, deps.conversationBooking, ctx);
-  registerRequestCallback(server, deps.callbackQueue, ctx);
+  registerRequestCallback(server, deps.dayCallbacks, ctx);
 
   try {
     await server.connect(transport);

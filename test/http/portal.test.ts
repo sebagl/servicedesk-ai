@@ -8,9 +8,16 @@ vi.mock("@telnyx/edge-runtime", () => ({
 
 import handler from "../../src/index";
 import { DayAgenda } from "../../src/actors/day-agenda";
-import { computeKpis, summarizeObservability, type DayBookings } from "../../src/app/portal-reports";
+import {
+  computeKpis,
+  summarizeObservability,
+  getAppointmentsReport,
+  getKpisReport,
+  type DayBookings,
+} from "../../src/app/portal-reports";
 import { emptySnapshot, type MetricsSnapshot } from "../../src/actors/metrics";
 import { addDays, getLocalDateString } from "../../src/domain/scheduling";
+import { callbacksActorName } from "../../src/domain/business-rules";
 import type { AppConfig } from "../../src/domain/config";
 
 const PORTAL_TOKEN = "portal-test-token-value";
@@ -57,7 +64,10 @@ function makeEnv(opts: { secret?: string | null; metrics?: Record<string, Metric
       }),
     })),
   };
-  const listCallbacks = vi.fn(async () => [
+  // Default: only today's DayCallbacks actor has the single fixture entry;
+  // every other day returns []. Tests can override per-day entries by
+  // mocking `dayCallbacks.idFromName` themselves.
+  const todayCallbacksEntry = [
     {
       id: "cb-1",
       conversation_id: "conv-9",
@@ -66,8 +76,14 @@ function makeEnv(opts: { secret?: string | null; metrics?: Record<string, Metric
       reason: "pricing",
       created_at: "2026-10-18T09:00:00.000Z",
     },
-  ]);
-  const callbackQueue = { idFromName: vi.fn(() => ({ listCallbacks })) };
+  ];
+  const dayCallbacks = {
+    idFromName: vi.fn((name: string) => ({
+      listCallbacks: vi.fn(async () =>
+        name === `callbacks-${today}` ? todayCallbacksEntry : [],
+      ),
+    })),
+  };
   const metricsByName = opts.metrics ?? {};
   const metrics = {
     idFromName: vi.fn((name: string) => ({
@@ -85,9 +101,9 @@ function makeEnv(opts: { secret?: string | null; metrics?: Record<string, Metric
     }),
   };
   return {
-    env: { SECRETS: secrets, CONFIG: kv, AGENDA: agenda, CALLBACK_QUEUE: callbackQueue, METRICS: metrics },
+    env: { SECRETS: secrets, CONFIG: kv, AGENDA: agenda, DAY_CALLBACKS: dayCallbacks, METRICS: metrics },
     agenda,
-    callbackQueue,
+    dayCallbacks,
     metrics,
     kv,
     listBookings,
@@ -109,7 +125,7 @@ describe("/api/* — PORTAL_AUTH gate", () => {
       expect(await res.json()).toEqual({ error: "service_unavailable" });
       expect(m.agenda.idFromName).not.toHaveBeenCalled();
       expect(m.metrics.idFromName).not.toHaveBeenCalled();
-      expect(m.callbackQueue.idFromName).not.toHaveBeenCalled();
+      expect(m.dayCallbacks.idFromName).not.toHaveBeenCalled();
       expect(m.kv.get).not.toHaveBeenCalled();
     });
 
@@ -120,7 +136,7 @@ describe("/api/* — PORTAL_AUTH gate", () => {
         expect(res.status).toBe(401);
         expect(m.agenda.idFromName).not.toHaveBeenCalled();
         expect(m.metrics.idFromName).not.toHaveBeenCalled();
-        expect(m.callbackQueue.idFromName).not.toHaveBeenCalled();
+        expect(m.dayCallbacks.idFromName).not.toHaveBeenCalled();
         expect(m.kv.get).not.toHaveBeenCalled();
       }
     });
@@ -140,16 +156,17 @@ describe("/api/* — PORTAL_AUTH gate", () => {
 });
 
 describe("GET /api/appointments", () => {
-  it("fans out to the 7 known DayAgenda names and returns bookings + callbacks", async () => {
+  it("fans out to the 7 known DayAgenda names and the 7 known DayCallbacks names", async () => {
     const m = makeEnv();
     const res = await handler.fetch(get("/api/appointments", PORTAL_TOKEN), m.env as never);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { timezone: string; days: DayBookings[]; callbacks: unknown[] };
+    const body = (await res.json()) as { timezone: string; days: DayBookings[]; callbacks: unknown[]; callbacks_ok: boolean };
     const today = getLocalDateString(Date.now());
     expect(body.timezone).toBe("America/Mexico_City");
     expect(body.days.map((d) => d.date)).toEqual(Array.from({ length: 7 }, (_, i) => addDays(today, i)));
     expect(m.listBookings.mock.calls.map((c) => c[0])).toEqual(body.days.map((d) => `main-${d.date}`));
     expect(body.days[0]!.bookings[0]).toEqual(booking("09:00", "+5215500000001"));
+    expect(body.callbacks_ok).toBe(true);
     expect(body.callbacks).toEqual([
       {
         id: "cb-1",
@@ -161,14 +178,142 @@ describe("GET /api/appointments", () => {
     ]);
   });
 
-  it("actor failure → 503 with a generic body", async () => {
+  it("bookings side failure → 503 with a generic body", async () => {
     const m = makeEnv();
-    m.callbackQueue.idFromName.mockImplementation(() => {
+    m.agenda.idFromName.mockImplementation(() => {
       throw new Error("boom detail");
     });
     const res = await handler.fetch(get("/api/appointments", PORTAL_TOKEN), m.env as never);
     expect(res.status).toBe(503);
     expect(await res.text()).not.toContain("boom");
+  });
+});
+
+describe("Portal resilience — partial failure on callbacks", () => {
+  it("getAppointmentsReport returns bookings + callbacks: [] + callbacks_ok: false on callback failure", async () => {
+    const today = getLocalDateString(Date.now());
+    const listByName: Record<string, () => Promise<unknown[]>> = {
+      [callbacksActorName(today)]: () => {
+        throw new Error("callbacks down");
+      },
+      [callbacksActorName(addDays(today, -1))]: async () => [],
+      [callbacksActorName(addDays(today, -2))]: async () => [],
+      [callbacksActorName(addDays(today, -3))]: async () => [],
+      [callbacksActorName(addDays(today, -4))]: async () => [],
+      [callbacksActorName(addDays(today, -5))]: async () => [],
+      [callbacksActorName(addDays(today, -6))]: async () => [],
+    };
+    const idFromName = vi.fn((name: string) => ({
+      listCallbacks: vi.fn(() => listByName[name]!()),
+    }));
+    const dayCallbacks = { idFromName };
+    const deps = {
+      agenda: { idFromName: vi.fn(() => ({ listBookings: vi.fn(async () => ({ bookings: [booking("09:00", "+5215500000001")] })) })) },
+      dayCallbacks,
+      metrics: { idFromName: vi.fn(() => ({ snapshot: vi.fn(async () => emptySnapshot()) })) },
+    };
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const report = await getAppointmentsReport(deps as never, Date.now());
+      expect(report).not.toBeNull();
+      expect(report!.callbacks).toEqual([]);
+      expect(report!.callbacks_ok).toBe(false);
+      // Bookings still come through on the partial report.
+      expect(report!.days[0]!.bookings).toHaveLength(1);
+      const events = logSpy.mock.calls
+        .map((call) => call[0])
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter((e) => e.event === "portal.report_partial");
+      expect(events).toHaveLength(1);
+      expect(events[0]!.route).toBe("/api/appointments");
+      expect(typeof events[0]!.reason).toBe("string");
+      expect((events[0]!.reason as string).length).toBeLessThanOrEqual(160);
+      // Reason carries error name and message, never entry contents.
+      expect(JSON.stringify(events[0])).toContain("callbacks down");
+      expect(JSON.stringify(events[0])).not.toContain("+5215500000001");
+      expect(JSON.stringify(events[0])).not.toContain("Bob");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("getKpisReport returns pending_callbacks: 0 and callbacks_ok: false on callback failure", async () => {
+    const today = getLocalDateString(Date.now());
+    const listByName: Record<string, () => Promise<unknown[]>> = {
+      [callbacksActorName(today)]: () => {
+        throw new Error("callbacks down");
+      },
+      [callbacksActorName(addDays(today, -1))]: async () => [],
+      [callbacksActorName(addDays(today, -2))]: async () => [],
+      [callbacksActorName(addDays(today, -3))]: async () => [],
+      [callbacksActorName(addDays(today, -4))]: async () => [],
+      [callbacksActorName(addDays(today, -5))]: async () => [],
+      [callbacksActorName(addDays(today, -6))]: async () => [],
+    };
+    const idFromName = vi.fn((name: string) => ({
+      listCallbacks: vi.fn(() => listByName[name]!()),
+    }));
+    const dayCallbacks = { idFromName };
+    const deps = {
+      agenda: { idFromName: vi.fn(() => ({ listBookings: vi.fn(async () => ({ bookings: [booking("09:00", "+5215500000001")] })) })) },
+      dayCallbacks,
+      metrics: { idFromName: vi.fn(() => ({ snapshot: vi.fn(async () => emptySnapshot()) })) },
+    };
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const report = await getKpisReport(deps as never, Date.now());
+      expect(report).not.toBeNull();
+      expect(report!.callbacks_ok).toBe(false);
+      expect(report!.kpis.pending_callbacks).toBe(0);
+      const events = logSpy.mock.calls
+        .map((call) => call[0])
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter((e) => e.event === "portal.report_partial");
+      expect(events).toHaveLength(1);
+      expect(events[0]!.route).toBe("/api/kpis");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("multiple failing days still emit a single portal.report_partial event", async () => {
+    const today = getLocalDateString(Date.now());
+    const fail = () => {
+      throw new Error("boom");
+    };
+    const listByName: Record<string, () => Promise<unknown[]>> = {
+      [callbacksActorName(today)]: fail,
+      [callbacksActorName(addDays(today, -1))]: fail,
+      [callbacksActorName(addDays(today, -2))]: fail,
+      [callbacksActorName(addDays(today, -3))]: async () => [],
+      [callbacksActorName(addDays(today, -4))]: async () => [],
+      [callbacksActorName(addDays(today, -5))]: async () => [],
+      [callbacksActorName(addDays(today, -6))]: async () => [],
+    };
+    const idFromName = vi.fn((name: string) => ({
+      listCallbacks: vi.fn(() => listByName[name]!()),
+    }));
+    const dayCallbacks = { idFromName };
+    const deps = {
+      agenda: { idFromName: vi.fn(() => ({ listBookings: vi.fn(async () => ({ bookings: [] })) })) },
+      dayCallbacks,
+      metrics: { idFromName: vi.fn(() => ({ snapshot: vi.fn(async () => emptySnapshot()) })) },
+    };
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const report = await getAppointmentsReport(deps as never, Date.now());
+      expect(report!.callbacks_ok).toBe(false);
+      const events = logSpy.mock.calls
+        .map((call) => call[0])
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => JSON.parse(s) as Record<string, unknown>)
+        .filter((e) => e.event === "portal.report_partial");
+      expect(events).toHaveLength(1);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 
@@ -233,6 +378,7 @@ describe("KPI math", () => {
     );
     expect(body).toEqual({
       window_days: 7,
+      callbacks_ok: true,
       kpis: {
         follow_up_opportunities: 4,
         checked_availability_not_booked: 1,

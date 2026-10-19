@@ -3,9 +3,9 @@
 An AI receptionist for a fictional auto repair shop, built on Telnyx Edge Compute.
 
 This repository contains the booking-domain implementation (HTTP + MCP adapters,
-KV config, per-location/day Actor) plus the smoke-test platform probe. See
-[docs/architecture.md](docs/architecture.md) for the full design and
-[docs/verification.md](docs/verification.md) for recorded evidence.
+KV config, per-location/day Actor). See [docs/architecture.md](docs/architecture.md)
+for the full design and [docs/verification.md](docs/verification.md) for recorded
+evidence.
 
 ## Prerequisites
 
@@ -52,7 +52,8 @@ Source: [Project Structure](https://developers.telnyx.com/docs/edge-compute/stat
   - `GET /demo/availability?date=YYYY-MM-DD` — slots for one date, marked with
     `DayAgenda` occupancy.
   - `POST /demo/bookings` — create one booking (delegates to the Actor).
-  - `POST|GET /demo/counter/:id/{increment,read}` — platform probe.
+  - `GET /demo/callbacks` — pending callback requests across the last 7 local
+    days, merged newest first from one `DayCallbacks` actor per day.
 
 ## MCP tools
 
@@ -117,7 +118,7 @@ or tool result.
 ```bash
 npm install
 npm run typecheck    # tsc --noEmit (strict mode) — 0 errors
-npm test             # vitest run (mocked) — 510/510 passing (14 files)
+npm test             # vitest run (mocked)
 ```
 
 ### Local runtime (verified historical probe)
@@ -128,18 +129,14 @@ Requires Docker. Downloads ~1 GB on first run.
 telnyx-edge dev --no-watch   # serves at http://127.0.0.1:8787
 ```
 
-The counter snippets below are **historical** evidence recorded before the auth
-gate was added (subtasks 1.2/1.3 in `docs/verification.md`). Local `dev` does
-not emulate `[[secrets]]`, so `/demo/counter/*` now returns `503` locally and
-those exact curls no longer reproduce.
+Local `dev` does not emulate `[[secrets]]` or `[storage.kv]` bindings, so
+auth-gated demo routes, `/mcp`, and the dynamic-variables webhook all fail
+closed (503) without bound credentials — exactly the behavior the mocked test
+suite exercises.
 
 ```bash
 curl http://127.0.0.1:8787/health
 # → {"status":"ok","service":"servicedesk-ai"}
-
-# Pre-auth-gate (historical): counter persistence + isolation were verified
-# in subtasks 1.2 and 1.3 against the same local stack. The unauthenticated
-# curls in the original README are no longer reproducible locally.
 ```
 
 Stop the stack:

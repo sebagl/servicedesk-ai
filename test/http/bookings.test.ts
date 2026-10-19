@@ -60,7 +60,6 @@ function makeEnv(
 } {
   const idFromName = vi.fn(() => agendaStub);
   const env = {
-    COUNTER: { idFromName: () => ({}) },
     AGENDA: { idFromName },
     SECRETS: secrets,
     CONFIG: config,
@@ -500,7 +499,6 @@ describe("POST /demo/bookings", () => {
     it("503 when CONFIG binding is missing", async () => {
       const stub: AgendaStub = { getOccupiedSlots: vi.fn(), createBooking: vi.fn() };
       const env = {
-        COUNTER: { idFromName: () => ({}) },
         AGENDA: { idFromName: vi.fn(() => stub) },
         SECRETS: validSecrets(),
       };
@@ -511,7 +509,6 @@ describe("POST /demo/bookings", () => {
 
     it("503 when AGENDA binding is missing", async () => {
       const env = {
-        COUNTER: { idFromName: () => ({}) },
         SECRETS: validSecrets(),
         CONFIG: validKv(),
       };

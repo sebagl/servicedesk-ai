@@ -1,8 +1,7 @@
 import type { ActorNamespace, ActorStub, IdFromNameOptions } from "@telnyx/edge-runtime";
 
-import type { CallbackQueue } from "./callback-queue";
 import type { ConversationBooking } from "./conversation-booking";
-import type { Counter } from "./counter";
+import type { DayCallbacks } from "./day-callbacks";
 import type { DayAgenda } from "./day-agenda";
 import type { Metrics } from "./metrics";
 
@@ -20,18 +19,13 @@ export interface ConversationBookingNamespace extends ActorNamespace {
   idFromName(name: string, options?: IdFromNameOptions): ConversationBookingStub;
 }
 
-export type CallbackQueueStub = ActorStub &
-  Pick<CallbackQueue, "requestCallback" | "listCallbacks">;
-export interface CallbackQueueNamespace extends ActorNamespace {
-  idFromName(name: string, options?: IdFromNameOptions): CallbackQueueStub;
+export type DayCallbacksStub = ActorStub &
+  Pick<DayCallbacks, "requestCallback" | "listCallbacks">;
+export interface DayCallbacksNamespace extends ActorNamespace {
+  idFromName(name: string, options?: IdFromNameOptions): DayCallbacksStub;
 }
 
 export type MetricsStub = ActorStub & Pick<Metrics, "record" | "snapshot">;
 export interface MetricsNamespace extends ActorNamespace {
   idFromName(name: string, options?: IdFromNameOptions): MetricsStub;
-}
-
-export type CounterStub = ActorStub & Pick<Counter, "increment" | "read">;
-export interface CounterNamespace extends ActorNamespace {
-  idFromName(name: string, options?: IdFromNameOptions): CounterStub;
 }

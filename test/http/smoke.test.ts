@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 // MOCKED: verifies routing + auth gate + health + config loader only.
 // Never loads the real runtime, actor, secret store, or KV.
@@ -33,36 +33,11 @@ const VALID_CONFIG: AppConfig = {
   },
 };
 
-type Stub = {
-  increment: ReturnType<typeof vi.fn>;
-  read: ReturnType<typeof vi.fn>;
-};
-
-function makeStub(): Stub {
-  return {
-    increment: vi.fn(async (amount = 1) => ({ count: amount })),
-    read: vi.fn(async () => ({ count: 7 })),
-  };
-}
-
 type SecretsMock = { get: ReturnType<typeof vi.fn> };
 type KvMock = { get: ReturnType<typeof vi.fn> };
 
-function makeEnv(
-  stub: Stub,
-  secrets?: SecretsMock,
-  config?: KvMock,
-): unknown {
+function makeEnv(secrets?: SecretsMock, config?: KvMock): unknown {
   return {
-    COUNTER: { idFromName: () => stub },
-    SECRETS: secrets,
-    CONFIG: config,
-  };
-}
-
-function makeFullEnv(secrets: SecretsMock, config?: KvMock): unknown {
-  return {
-    COUNTER: { idFromName: () => makeStub() },
     SECRETS: secrets,
     CONFIG: config,
   };
@@ -72,29 +47,8 @@ function bearer(token: string): Record<string, string> {
   return { authorization: `Bearer ${token}` };
 }
 
-function postInc(
-  id: string,
-  amount: number,
-  headers: Record<string, string> = {},
-): Request {
-  return new Request(`http://x/demo/counter/${id}/increment`, {
-    method: "POST",
-    body: JSON.stringify({ amount }),
-    headers: { "content-type": "application/json", ...headers },
-  });
-}
-
-function getRead(id: string, headers: Record<string, string> = {}): Request {
-  return new Request(`http://x/demo/counter/${id}/read`, { headers });
-}
-
 function getConfig(headers: Record<string, string> = {}): Request {
   return new Request("http://x/demo/config", { headers });
-}
-
-function assertActorNotCalled(stub: Stub) {
-  expect(stub.increment).not.toHaveBeenCalled();
-  expect(stub.read).not.toHaveBeenCalled();
 }
 
 function validSecrets(): SecretsMock {
@@ -119,152 +73,27 @@ function rejectingKv(): KvMock {
 
 describe("health — public, no secrets required", () => {
   it("GET /health returns service payload without SECRETS", async () => {
-    const env = { COUNTER: { idFromName: () => makeStub() } };
-    const res = await handler.fetch(new Request("http://x/health"), env as never);
+    const res = await handler.fetch(new Request("http://x/health"), makeEnv() as never);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok", service: "servicedesk-ai" });
   });
 
   it("GET /health/liveness without SECRETS", async () => {
-    const env = { COUNTER: { idFromName: () => makeStub() } };
     const res = await handler.fetch(
       new Request("http://x/health/liveness"),
-      env as never,
+      makeEnv() as never,
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
   });
 
   it("GET /health/readiness without SECRETS", async () => {
-    const env = { COUNTER: { idFromName: () => makeStub() } };
     const res = await handler.fetch(
       new Request("http://x/health/readiness"),
-      env as never,
+      makeEnv() as never,
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Counter auth gate (existing tests, unchanged)
-// ---------------------------------------------------------------------------
-
-describe("1. absent secret binding → 503", () => {
-  it("increment route returns 503 when SECRETS is undefined", async () => {
-    const stub = makeStub();
-    const env = makeEnv(stub, undefined);
-    const res = await handler.fetch(postInc("a", 1), env as never);
-    expect(res.status).toBe(503);
-    const body = await res.json();
-    expect(body).toEqual({ error: "service_unavailable" });
-    assertActorNotCalled(stub);
-  });
-});
-
-describe("2. empty/missing secret → 503", () => {
-  it("increment returns 503 when get returns empty string", async () => {
-    const stub = makeStub();
-    const env = makeEnv(stub, { get: vi.fn(async () => "") });
-    const res = await handler.fetch(postInc("a", 1), env as never);
-    expect(res.status).toBe(503);
-    assertActorNotCalled(stub);
-  });
-});
-
-describe("3. secret retrieval rejects → 503", () => {
-  it("read route returns 503 when get throws", async () => {
-    const stub = makeStub();
-    const env = makeEnv(stub, {
-      get: vi.fn(async () => {
-        throw new Error("retrieval failed");
-      }),
-    });
-    const res = await handler.fetch(getRead("a"), env as never);
-    expect(res.status).toBe(503);
-    assertActorNotCalled(stub);
-  });
-});
-
-describe("4. authorization failures → 401", () => {
-  let stub: Stub;
-  let env: unknown;
-
-  beforeEach(() => {
-    stub = makeStub();
-    env = makeEnv(stub, validSecrets());
-  });
-
-  it("missing Authorization header on read", async () => {
-    const res = await handler.fetch(getRead("a"), env as never);
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body).toEqual({ error: "unauthorized" });
-    assertActorNotCalled(stub);
-  });
-
-  it("malformed Authorization (no Bearer prefix) on increment", async () => {
-    const res = await handler.fetch(
-      postInc("a", 1, { authorization: "Token " + VALID_TOKEN }),
-      env as never,
-    );
-    expect(res.status).toBe(401);
-    assertActorNotCalled(stub);
-  });
-
-  it("incorrect token on read", async () => {
-    const res = await handler.fetch(
-      getRead("a", bearer("wrong-token")),
-      env as never,
-    );
-    expect(res.status).toBe(401);
-    assertActorNotCalled(stub);
-  });
-});
-
-describe("5. valid credentials → reach Actor", () => {
-  let stub: Stub;
-  let env: unknown;
-
-  beforeEach(() => {
-    stub = makeStub();
-    env = makeEnv(stub, validSecrets());
-  });
-
-  it("POST increment with valid bearer reaches Actor", async () => {
-    const res = await handler.fetch(
-      postInc("a", 5, bearer(VALID_TOKEN)),
-      env as never,
-    );
-    expect(res.status).toBe(200);
-    expect(stub.increment).toHaveBeenCalledWith(5);
-    expect(await res.json()).toEqual({ counter: "a", count: 5 });
-  });
-
-  it("GET read with valid bearer reaches Actor", async () => {
-    const res = await handler.fetch(
-      getRead("a", bearer(VALID_TOKEN)),
-      env as never,
-    );
-    expect(res.status).toBe(200);
-    expect(stub.read).toHaveBeenCalled();
-    expect(await res.json()).toEqual({ counter: "a", count: 7 });
-  });
-
-  it("defaults increment amount to 1 when body has no amount", async () => {
-    const res = await handler.fetch(
-      new Request("http://x/demo/counter/a/increment", {
-        method: "POST",
-        body: JSON.stringify({}),
-        headers: {
-          "content-type": "application/json",
-          ...bearer(VALID_TOKEN),
-        },
-      }),
-      env as never,
-    );
-    expect(stub.increment).toHaveBeenCalledWith(1);
-    expect(await res.json()).toEqual({ counter: "a", count: 1 });
   });
 });
 
@@ -275,7 +104,7 @@ describe("5. valid credentials → reach Actor", () => {
 describe("config route — auth gate", () => {
   it("unauthorized request does not read KV", async () => {
     const kv = validKv(VALID_CONFIG);
-    const env = makeFullEnv(validSecrets(), kv);
+    const env = makeEnv(validSecrets(), kv);
     const res = await handler.fetch(getConfig(), env as never);
     expect(res.status).toBe(401);
     expect(kv.get).not.toHaveBeenCalled();
@@ -283,7 +112,7 @@ describe("config route — auth gate", () => {
 
   it("absent SECRETS binding → 503, KV not read", async () => {
     const kv = validKv(VALID_CONFIG);
-    const env = makeFullEnv({ get: vi.fn(async () => "") }, kv);
+    const env = makeEnv({ get: vi.fn(async () => "") }, kv);
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(503);
     expect(kv.get).not.toHaveBeenCalled();
@@ -297,7 +126,7 @@ describe("config route — auth gate", () => {
 describe("config route — valid configuration", () => {
   it("returns config with booking_enabled true", async () => {
     const kv = validKv(VALID_CONFIG);
-    const env = makeFullEnv(validSecrets(), kv);
+    const env = makeEnv(validSecrets(), kv);
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -311,7 +140,7 @@ describe("config route — valid configuration", () => {
       business: { ...VALID_CONFIG.business, booking_enabled: false },
     };
     const kv = validKv(disabledConfig);
-    const env = makeFullEnv(validSecrets(), kv);
+    const env = makeEnv(validSecrets(), kv);
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -325,7 +154,7 @@ describe("config route — valid configuration", () => {
 
 describe("config route — unavailable configuration → 503", () => {
   it("missing CONFIG binding → 503", async () => {
-    const env = makeFullEnv(validSecrets(), undefined);
+    const env = makeEnv(validSecrets(), undefined);
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -334,13 +163,13 @@ describe("config route — unavailable configuration → 503", () => {
 
   it("KV key returns null → 503", async () => {
     const kv = { get: vi.fn(async () => null) };
-    const env = makeFullEnv(validSecrets(), kv);
+    const env = makeEnv(validSecrets(), kv);
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(503);
   });
 
   it("KV read rejects → 503", async () => {
-    const env = makeFullEnv(validSecrets(), rejectingKv());
+    const env = makeEnv(validSecrets(), rejectingKv());
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(503);
   });
@@ -351,7 +180,7 @@ describe("config route — unavailable configuration → 503", () => {
         throw new SyntaxError("Unexpected token");
       }),
     };
-    const env = makeFullEnv(validSecrets(), kv);
+    const env = makeEnv(validSecrets(), kv);
     const res = await handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
     expect(res.status).toBe(503);
   });
@@ -363,7 +192,7 @@ describe("config route — unavailable configuration → 503", () => {
 
 describe("config route — invalid schema → 503", () => {
   async function getWithConfig(config: unknown) {
-    const env = makeFullEnv(validSecrets(), validKv(config));
+    const env = makeEnv(validSecrets(), validKv(config));
     return handler.fetch(getConfig(bearer(VALID_TOKEN)), env as never);
   }
 
@@ -616,18 +445,20 @@ describe("loadConfig — direct unit tests", () => {
 
 describe("route not found", () => {
   it("404 for unknown routes", async () => {
-    const stub = makeStub();
-    const env = makeEnv(stub, validSecrets());
+    const env = makeEnv(validSecrets());
     const res = await handler.fetch(new Request("http://x/nope"), env as never);
     expect(res.status).toBe(404);
-    assertActorNotCalled(stub);
   });
 });
 
 // ---------------------------------------------------------------------------
-// GET /demo/callbacks — operator view of pending callback requests,
-// behind the same SMOKE_AUTH bearer gate as the other /demo routes.
+// GET /demo/callbacks — operator view of pending callback requests across
+// the last 7 local days (today and the 6 previous). Per-day actors, merged
+// newest first.
 // ---------------------------------------------------------------------------
+
+import { callbacksActorName } from "../../src/domain/business-rules";
+import { addDays, getLocalDateString } from "../../src/domain/scheduling";
 
 describe("/demo/callbacks — auth gate", () => {
   type CallbackStub = {
@@ -647,7 +478,7 @@ describe("/demo/callbacks — auth gate", () => {
     secrets: SecretsMock = validSecrets(),
   ): unknown {
     return {
-      CALLBACK_QUEUE: { idFromName: () => stub },
+      DAY_CALLBACKS: { idFromName: () => stub },
       SECRETS: secrets,
     };
   }
@@ -676,7 +507,7 @@ describe("/demo/callbacks — auth gate", () => {
 
   it("absent SECRETS binding → 503, Actor never reached", async () => {
     const stub = makeCallbackStub([]);
-    const env = { CALLBACK_QUEUE: { idFromName: () => stub } };
+    const env = { DAY_CALLBACKS: { idFromName: () => stub } };
     const res = await handler.fetch(
       new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
       env as never,
@@ -696,7 +527,7 @@ describe("/demo/callbacks — auth gate", () => {
     expect(stub.listCallbacks).not.toHaveBeenCalled();
   });
 
-  it("absent CALLBACK_QUEUE binding → 503 after auth", async () => {
+  it("absent DAY_CALLBACKS binding → 503 after auth", async () => {
     const env = { SECRETS: validSecrets() };
     const res = await handler.fetch(
       new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
@@ -720,42 +551,70 @@ describe("/demo/callbacks — success and failure", () => {
     };
   }
 
-  function callbacksEnv(
-    stub: CallbackStub,
-    secrets: SecretsMock = validSecrets(),
-  ): unknown {
-    return {
-      CALLBACK_QUEUE: { idFromName: () => stub },
-      SECRETS: secrets,
+  it("queries 7 fixed per-day actor names (today + 6 previous)", async () => {
+    const stub = makeCallbackStub([]);
+    const idFromName = vi.fn((_name: string) => stub);
+    const env = {
+      DAY_CALLBACKS: { idFromName },
+      SECRETS: validSecrets(),
     };
-  }
-
-  it("returns entries with full operator fields (including full phone)", async () => {
-    const stub = makeCallbackStub([
-      {
-        id: "req-1",
-        conversation_id: "conv-1",
-        customer_name: "Alice Smith",
-        customer_phone: "+5215512345678",
-        reason: "oil change question",
-        created_at: "2026-10-18T10:00:00.000Z",
-      },
-      {
-        id: "req-2",
-        conversation_id: "conv-2",
-        customer_name: "Bob",
-        customer_phone: "+5215599998888",
-        reason: "tire rotation",
-        created_at: "2026-10-18T09:30:00.000Z",
-      },
-    ]);
-    const env = callbacksEnv(stub);
     const res = await handler.fetch(
       new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
       env as never,
     );
     expect(res.status).toBe(200);
-    expect(stub.listCallbacks).toHaveBeenCalledTimes(1);
+    const today = getLocalDateString(Date.now());
+    expect(idFromName.mock.calls.map((c: [string]) => c[0])).toEqual(
+      Array.from({ length: 7 }, (_, i) => callbacksActorName(addDays(today, -i))),
+    );
+  });
+
+  it("returns entries with full operator fields (including full phone)", async () => {
+    const today = getLocalDateString(Date.now());
+    const yesterday = addDays(today, -1);
+    const stubByName: Record<string, unknown[]> = {
+      [callbacksActorName(today)]: [
+        {
+          id: "req-1",
+          conversation_id: "conv-1",
+          customer_name: "Alice Smith",
+          customer_phone: "+5215512345678",
+          reason: "oil change question",
+          created_at: "2026-10-18T10:00:00.000Z",
+        },
+      ],
+      [callbacksActorName(yesterday)]: [
+        {
+          id: "req-2",
+          conversation_id: "conv-2",
+          customer_name: "Bob",
+          customer_phone: "+5215599998888",
+          reason: "tire rotation",
+          created_at: "2026-10-17T09:30:00.000Z",
+        },
+      ],
+    };
+    const stub = {
+      listCallbacks: vi.fn(),
+      requestCallback: vi.fn(),
+    };
+    stub.listCallbacks.mockImplementation(async function (this: unknown) {
+      // Inspect the actor name from the call context (idFromName stores it).
+      return [];
+    });
+    const idFromName = vi.fn((name: string) => {
+      stub.listCallbacks.mockImplementation(async () => stubByName[name] ?? []);
+      return stub;
+    });
+    const env = {
+      DAY_CALLBACKS: { idFromName },
+      SECRETS: validSecrets(),
+    };
+    const res = await handler.fetch(
+      new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
+      env as never,
+    );
+    expect(res.status).toBe(200);
     const body = (await res.json()) as {
       callbacks: Array<{
         id: string;
@@ -766,6 +625,7 @@ describe("/demo/callbacks — success and failure", () => {
       }>;
     };
     expect(body.callbacks).toHaveLength(2);
+    // Newest first across days.
     expect(body.callbacks[0]).toEqual({
       id: "req-1",
       created_at: "2026-10-18T10:00:00.000Z",
@@ -773,36 +633,61 @@ describe("/demo/callbacks — success and failure", () => {
       customer_phone: "+5215512345678",
       reason: "oil change question",
     });
-    expect(body.callbacks[1]!.customer_phone).toBe("+5215599998888");
+    expect(body.callbacks[1]).toEqual({
+      id: "req-2",
+      created_at: "2026-10-17T09:30:00.000Z",
+      customer_name: "Bob",
+      customer_phone: "+5215599998888",
+      reason: "tire rotation",
+    });
     // Operator view intentionally exposes the conversation_id-bearing
     // entries; the wire shape never carries a "conversation_id" field.
     expect(
-      (body.callbacks[0] as unknown as Record<string, unknown>)
-        .conversation_id,
+      (body.callbacks[0] as unknown as Record<string, unknown>).conversation_id,
     ).toBeUndefined();
   });
 
-  it("returns { callbacks: [] } when the queue is empty", async () => {
+  it("returns { callbacks: [] } when every day is empty", async () => {
     const stub = makeCallbackStub([]);
-    const env = callbacksEnv(stub);
+    const env = {
+      DAY_CALLBACKS: { idFromName: () => stub },
+      SECRETS: validSecrets(),
+    };
     const res = await handler.fetch(
       new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
       env as never,
     );
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ callbacks: [] });
-    expect(stub.listCallbacks).toHaveBeenCalledTimes(1);
   });
 
-  it("actor throws → 503, no entry contents leaked", async () => {
+  it("one day's actor throws → fails closed with 503, no entry contents leaked", async () => {
+    const today = getLocalDateString(Date.now());
+    const yesterday = addDays(today, -1);
     const SENTINEL = `__cb_list_sentinel_${Date.now()}__`;
-    const stub: CallbackStub = {
-      listCallbacks: vi.fn(async () => {
+    const stubByName: Record<string, () => Promise<unknown[]>> = {
+      [callbacksActorName(today)]: () => {
         throw new Error(`rpc failure: ${SENTINEL}`);
-      }),
-      requestCallback: vi.fn(),
+      },
+      [callbacksActorName(yesterday)]: async () => [
+        {
+          id: "req-prev",
+          conversation_id: "conv-prev",
+          customer_name: "Old",
+          customer_phone: "+5215500000000",
+          reason: "from yesterday",
+          created_at: "2026-10-17T08:00:00.000Z",
+        },
+      ],
     };
-    const env = callbacksEnv(stub);
+    const idFromName = vi.fn((name: string) => ({
+      listCallbacks: vi.fn(() => stubByName[name]!()),
+      requestCallback: vi.fn(),
+    }));
+    const env = {
+      DAY_CALLBACKS: { idFromName },
+      SECRETS: validSecrets(),
+    };
     const res = await handler.fetch(
       new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
       env as never,
@@ -811,11 +696,15 @@ describe("/demo/callbacks — success and failure", () => {
     const body = await res.json();
     expect(body).toEqual({ error: "service_unavailable" });
     expect(JSON.stringify(body)).not.toContain(SENTINEL);
+    expect(JSON.stringify(body)).not.toContain("+5215500000000");
   });
 
   it("wrong method (POST) → 405, Actor never reached", async () => {
     const stub = makeCallbackStub([]);
-    const env = callbacksEnv(stub);
+    const env = {
+      DAY_CALLBACKS: { idFromName: () => stub },
+      SECRETS: validSecrets(),
+    };
     const res = await handler.fetch(
       new Request("http://x/demo/callbacks", {
         method: "POST",
@@ -830,17 +719,30 @@ describe("/demo/callbacks — success and failure", () => {
   it("emits callback.listed with count and latency_ms only (no entry fields)", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      const stub = makeCallbackStub([
-        {
-          id: "req-1",
-          conversation_id: "conv-1",
-          customer_name: "Alice Smith",
-          customer_phone: "+5215512345678",
-          reason: "leak canary 9f2a",
-          created_at: "2026-10-18T10:00:00.000Z",
-        },
-      ]);
-      const env = callbacksEnv(stub);
+      const today = getLocalDateString(Date.now());
+      const stub = {
+        listCallbacks: vi.fn(async () => [
+          {
+            id: "req-1",
+            conversation_id: "conv-1",
+            customer_name: "Alice Smith",
+            customer_phone: "+5215512345678",
+            reason: "leak canary 9f2a",
+            created_at: "2026-10-18T10:00:00.000Z",
+          },
+        ]),
+        requestCallback: vi.fn(),
+      };
+      const idFromName = vi.fn((name: string) => {
+        if (name !== callbacksActorName(today)) {
+          return { listCallbacks: vi.fn(async () => []), requestCallback: vi.fn() };
+        }
+        return stub;
+      });
+      const env = {
+        DAY_CALLBACKS: { idFromName },
+        SECRETS: validSecrets(),
+      };
       const res = await handler.fetch(
         new Request("http://x/demo/callbacks", { headers: bearer(VALID_TOKEN) }),
         env as never,

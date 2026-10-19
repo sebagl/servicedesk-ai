@@ -7,11 +7,6 @@ name = "servicedesk-ai"
 main = "src/index.ts"
 compatibility_date = "2026-05-01"
 
-# Demo actor — platform-compatibility probe, NOT the booking actor.
-[[actors]]
-binding = "COUNTER"
-type    = "Counter"
-
 # Agenda Actor — one instance per location/day (e.g. main-2026-10-20).
 # Owns authoritative occupancy for that date.
 [[actors]]
@@ -25,12 +20,13 @@ type    = "DayAgenda"
 binding = "CONVERSATION_BOOKING"
 type    = "ConversationBooking"
 
-# Callback Queue — single shared instance ("main") holding the newest 200
-# callback requests. Per-conversation idempotency: the first request wins,
+# Day Callbacks — one instance per local calendar date (e.g.
+# callbacks-2026-10-19) holding the newest 200 callback requests.
+# Per-conversation idempotency: the first request in that day wins,
 # subsequent requests for the same conversation return the original entry.
 [[actors]]
-binding = "CALLBACK_QUEUE"
-type    = "CallbackQueue"
+binding = "DAY_CALLBACKS"
+type    = "DayCallbacks"
 
 # Metrics — one instance per local day (e.g. metrics-2026-10-20) holding
 # counters, latency sums, bounded conversation-id sets and the newest 50
@@ -45,7 +41,7 @@ type    = "Metrics"
 [storage.kv.CONFIG]
 id = "533e7681-de0d-4af6-bf4d-1da671f7f5d3"
 
-# Smoke-test authentication secret for /demo/counter/* routes.
+# Smoke-test authentication secret for /demo/* routes.
 # Set independently of TELNYX_API_KEY: `telnyx-edge secrets add SMOKE_TEST_TOKEN <value>`.
 # Local `dev` does not emulate secrets — demo routes fail closed (503) without it.
 [[secrets]]

@@ -32,7 +32,7 @@ telnyx-edge types    # regenerate telnyx-env.d.ts from manifest
 - `src/mcp/` — MCP server; `tools/` has one file per tool
 - `src/app/` — transport-independent use cases (availability, booking service, portal reports)
 - `src/domain/` — pure rules: business rules, scheduling, config validation, conversation booking coordinator
-- `src/actors/` — Stateful Actors (DayAgenda, ConversationBooking, CallbackQueue, Metrics, Counter) and their typed bindings
+- `src/actors/` — Stateful Actors (DayAgenda, ConversationBooking, DayCallbacks, Metrics) and their typed bindings
 - `src/observability/` — structured logger and bounded metric recording
 - `src/portal/` — operator portal HTML page
 - `config/main.json` — non-sensitive demo seed configuration

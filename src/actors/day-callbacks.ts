@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import { StatefulActor } from "@telnyx/edge-runtime";
 
 // ---------------------------------------------------------------------------
-// CallbackQueue — single shared Actor holding the newest 200 callback
-// requests. Persists one key ("queue") containing an array of entries.
-// Per-conversation idempotency: the first request wins, any subsequent
-// request from the same conversation returns the original entry. Name and
-// phone are accepted on the wire but never returned by the API surface;
-// they live only inside the actor's persisted state.
+// DayCallbacks — one Actor per local calendar date ("callbacks-YYYY-MM-DD").
+// Persists the newest 200 callback requests in a single "queue" key, newest
+// first. Per-conversation idempotency: the first request in a conversation
+// wins inside this day's instance; subsequent requests for the same
+// conversation return the original entry. Name and phone are accepted on
+// the wire but never returned by the API surface; they live only inside
+// the actor's persisted state.
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY = "queue";
@@ -65,7 +66,7 @@ function validateQueue(raw: unknown): CallbackEntry[] {
   return out;
 }
 
-export class CallbackQueue extends StatefulActor {
+export class DayCallbacks extends StatefulActor {
   async listCallbacks(): Promise<CallbackEntry[]> {
     try {
       const storage = (this.ctx as { storage: ActorStorageLike }).storage;
