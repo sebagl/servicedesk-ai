@@ -15,7 +15,7 @@ miss calls while their staff is busy, and lose bookings because nobody answers.
 | MCP server | `POST /mcp` (streamable HTTP, bearer token) |
 | Operator portal | `GET /portal` (data behind a portal token) |
 | Health | `GET /health` |
-| Access | Telnyx **web call** from the assistant page. The trial account can only purchase Mexico local numbers, which were out of stock, so no phone number is attached. |
+| Talk to the assistant | `GET /call` — web call from the browser (password shared by email). The trial account can only purchase Mexico local numbers, which were out of stock, so no phone number is attached. |
 
 Further reading: [architecture](docs/architecture.md) ·
 [debugging stories](docs/debugging.md) · [verification](docs/verification.md) ·
@@ -23,7 +23,8 @@ Further reading: [architecture](docs/architecture.md) ·
 
 ## How to interact
 
-Call the assistant (or start a web call) and speak in English:
+Open `/call`, enter the password from the email (any username), start the call, allow the
+microphone and speak in English:
 
 - *"What services do you offer?"* — answers from the live catalog.
 - *"I'd like an oil change on Thursday."* — offers real open times, collects your
@@ -218,6 +219,8 @@ telnyx-edge secrets add MCP_API_TOKEN "<random>"        # bearer for /mcp
 telnyx-edge secrets add PORTAL_API_TOKEN "<random>"     # bearer for /api/*
 telnyx-edge secrets add SMOKE_TEST_TOKEN "<random>"     # bearer for /demo/*
 telnyx-edge secrets add TELNYX_PUBLIC_KEY "<account public key, base64>"
+telnyx-edge secrets add CALL_PAGE_PASSWORD "<password>"   # HTTP Basic password for /call
+telnyx-edge secrets add TELNYX_ASSISTANT_ID "<assistant-...>" # assistant embedded by /call
 telnyx-edge ship
 ```
 
@@ -241,6 +244,8 @@ Assistant configuration (Telnyx portal):
    defaults `booking_enabled = false`, `system_status = degraded`.
 3. **Workflow:** the nodes and edges above. MCP filler messages: "One moment while I
    check that."
+4. **Web calls:** enable unauthenticated web calls on the assistant (Widget tab /
+   `supports_unauthenticated_web_calls`) so the `/call` widget can connect.
 
 ## Repository layout
 
@@ -254,6 +259,7 @@ src/
   actors/             DayAgenda, ConversationBooking, DayCallbacks, Metrics
   observability/      structured logger, bounded metric recording
   portal/             operator portal page
+  call/               password-protected web call page (Telnyx widget)
 test/                 mirrors src/, plus integration/ and support/
 docs/                 architecture, debugging, verification, demo script
 ```
@@ -274,6 +280,8 @@ Found while building, with evidence in [docs/debugging.md](docs/debugging.md):
 
 ## Known limitations
 
-- Reached by web call: the trial account had no purchasable phone number (see the table at the top).
+- Reached by web call through `/call`: the trial account had no purchasable phone number.
+  The page is password-protected and the assistant id is kept in Edge secrets, because any
+  web call is billed to the account.
 - No cancel/reschedule tool: changes go through a callback request.
 - Callback requests are stored and visible to staff; there is no automatic call-back.

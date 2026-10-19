@@ -65,6 +65,7 @@ for fixed day names (no scans).
 | `GET /health` | none | Liveness |
 | `POST /webhooks/dynamic-variables` | Telnyx Ed25519 signature | Assistant init variables |
 | `POST /mcp` | `MCP_API_TOKEN` bearer; browser `Origin` refused | MCP server |
+| `GET /call` | HTTP Basic password (`CALL_PAGE_PASSWORD`) | Web call page with the Telnyx AI Agent widget |
 | `GET /portal` | none (page holds no data) | Operator portal |
 | `GET /api/{appointments,kpis,observability}` | `PORTAL_API_TOKEN` bearer | Portal data |
 | `/demo/{config,availability,bookings,callbacks}` | `SMOKE_TEST_TOKEN` bearer | Smoke tests |
@@ -121,9 +122,13 @@ invalid stored state fails closed instead of being treated as empty.
 
 ## Security and privacy
 
-- Secrets (`MCP_API_TOKEN`, `PORTAL_API_TOKEN`, `SMOKE_TEST_TOKEN`, `TELNYX_PUBLIC_KEY`)
+- Secrets (`MCP_API_TOKEN`, `PORTAL_API_TOKEN`, `SMOKE_TEST_TOKEN`, `TELNYX_PUBLIC_KEY`,
+  `CALL_PAGE_PASSWORD`, `TELNYX_ASSISTANT_ID`)
   live in Edge secrets and are never logged or returned. The two on the call path (MCP
   token, webhook public key) are cached per instance after a successful read.
 - Customer names and phone numbers are stored only inside Actors and returned only to
   the authenticated portal; logs carry a masked phone (`***1234`) at most.
 - Identifiers from requests are logged only if they match a safe character set.
+- The `/call` page is password-protected and the assistant id lives in Edge secrets: the
+  widget only needs that id, and every web call is billed to the account. Third-party
+  scripts on `/call` and `/portal` are pinned with Subresource Integrity.

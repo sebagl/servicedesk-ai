@@ -21,9 +21,22 @@ export function hasValidBearer(req: Request, token: string): boolean {
   return credential !== null && constantTimeEqual(credential, token);
 }
 
+// Password from an HTTP Basic `Authorization` header; the username is ignored.
+export function extractBasicPassword(req: Request): string | null {
+  const header = req.headers.get("authorization");
+  if (!header || !header.startsWith("Basic ")) return null;
+  try {
+    const decoded = atob(header.slice(6).trim());
+    const separator = decoded.indexOf(":");
+    return separator === -1 ? null : decoded.slice(separator + 1);
+  } catch {
+    return null;
+  }
+}
+
 async function readSecret(
   env: Env,
-  binding: "SMOKE_AUTH" | "PORTAL_AUTH" | "MCP_AUTH",
+  binding: "SMOKE_AUTH" | "PORTAL_AUTH" | "MCP_AUTH" | "CALL_PAGE_AUTH" | "ASSISTANT_ID",
 ): Promise<string | null> {
   if (!env.SECRETS) return null;
   try {
@@ -36,6 +49,16 @@ async function readSecret(
 
 export function getSmokeToken(env: Env): Promise<string | null> {
   return readSecret(env, "SMOKE_AUTH");
+}
+
+export function getCallPagePassword(env: Env): Promise<string | null> {
+  return readSecret(env, "CALL_PAGE_AUTH");
+}
+
+// Kept in Edge secrets rather than the repo: anyone who knows the assistant id
+// can start a web call, which is billed to the account.
+export function getAssistantId(env: Env): Promise<string | null> {
+  return readSecret(env, "ASSISTANT_ID");
 }
 
 export function getPortalToken(env: Env): Promise<string | null> {

@@ -74,6 +74,20 @@ name    = "TELNYX_PUBLIC_KEY"
 binding = "PORTAL_AUTH"
 name    = "PORTAL_API_TOKEN"
 
+# Password for the /call test page (HTTP Basic; the username is ignored).
+# Shared with evaluators out of band, never committed:
+#   `telnyx-edge secrets add CALL_PAGE_PASSWORD <value>`.
+[[secrets]]
+binding = "CALL_PAGE_AUTH"
+name    = "CALL_PAGE_PASSWORD"
+
+# Telnyx AI Assistant id embedded by the /call web widget. Kept out of the repo
+# because anyone who knows it can start a web call billed to the account:
+#   `telnyx-edge secrets add TELNYX_ASSISTANT_ID <assistant-...>`.
+[[secrets]]
+binding = "ASSISTANT_ID"
+name    = "TELNYX_ASSISTANT_ID"
+
 # Registered via `telnyx-edge new-func --actor` (2026-10-16).
 # Required for `ship`; `dev` and `types` do not need it.
 [edge_compute]

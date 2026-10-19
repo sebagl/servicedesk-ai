@@ -10,7 +10,7 @@ declare global {
     DAY_CALLBACKS: __TelnyxActorNamespace<DayCallbacks>;
     METRICS: __TelnyxActorNamespace<Metrics>;
     CONFIG: __TelnyxKvNamespace;
-    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH" | "WEBHOOK_PUBLIC_KEY" | "PORTAL_AUTH"): Promise<string> };
+    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH" | "WEBHOOK_PUBLIC_KEY" | "PORTAL_AUTH" | "CALL_PAGE_AUTH" | "ASSISTANT_ID"): Promise<string> };
   }
 }
 
@@ -21,7 +21,7 @@ declare module "@telnyx/edge-runtime" {
     DAY_CALLBACKS: __TelnyxActorNamespace<DayCallbacks>;
     METRICS: __TelnyxActorNamespace<Metrics>;
     CONFIG: __TelnyxKvNamespace;
-    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH" | "WEBHOOK_PUBLIC_KEY" | "PORTAL_AUTH"): Promise<string> };
+    SECRETS: { get(binding: "SMOKE_AUTH" | "MCP_AUTH" | "WEBHOOK_PUBLIC_KEY" | "PORTAL_AUTH" | "CALL_PAGE_AUTH" | "ASSISTANT_ID"): Promise<string> };
   }
 }
 

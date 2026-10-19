@@ -1,4 +1,5 @@
 import type { Env } from "../env";
+import { handleCallPage } from "./routes/call";
 import { handleDemo, isDemoPath } from "./routes/demo";
 import { handleDynamicVariables } from "./routes/dynamic-variables";
 import { handleMcp } from "./routes/mcp";
@@ -16,6 +17,7 @@ export async function route(req: Request, env: Env): Promise<Response> {
   }
   if (pathname === "/webhooks/dynamic-variables") return handleDynamicVariables(req, env);
   if (pathname === "/mcp") return handleMcp(req, env);
+  if (pathname === "/call") return handleCallPage(req, env);
   if (isPortalPath(pathname)) return handlePortal(req, env, pathname);
   if (isDemoPath(pathname)) return handleDemo(req, env, url);
 

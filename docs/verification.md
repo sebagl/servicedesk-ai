@@ -69,7 +69,7 @@ Issues found in these runs and their fixes: [debugging.md](debugging.md) (bugs 2
 ## Scope
 
 - Calls were made through Telnyx web calls; the trial account had no purchasable phone
-  number.
+  number. Evaluators use the password-protected `/call` page.
 - The stale-config fallback (debugging bug 2) is verified by automated tests.
 - Concurrency was verified with 20 simultaneous requests for one slot; no load testing
   beyond that.
