@@ -136,6 +136,33 @@ Flipping `booking_enabled` in KV changes the call flow without a redeploy (withi
 | **`DayCallbacks` Actor** (one per day) | That day's callback requests | Appends without losing concurrent requests; idempotent per conversation. |
 | **`Metrics` Actor** (one per day) | Counters, latency sums, recent events | Counters are read-modify-write; feeds KPIs and the Observability tab. |
 
+## Timeouts, retries and idempotency
+
+Selected dependency calls use bounded waits so slow services do not hold the
+request indefinitely. The initialization webhook
+waits up to 1 second for its verification key and 2.5 seconds for KV configuration.
+Metrics recording has a separate 300 ms budget and is best-effort. Authentication
+fails closed; configuration can fall back to a recent successful cached value.
+For bookings, the conversation Actor preserves an uncertain attempt and its
+idempotency key rather than starting another write. A subsequent retry can recover the original
+booking without creating a duplicate. There is no general application-level
+automatic retry policy with exponential backoff.
+
+- **Timeout is not cancellation.** These bounded waits use `Promise.race`; the
+  underlying operation can finish after the response. A timeout does not prove
+  that a write failed or that nothing was persisted.
+- **Safe booking retries.** `ConversationBooking` saves the pending attempt and
+  its backend-generated key before calling `DayAgenda`. The agenda stores the
+  booking and idempotency record in one aggregate. The same key and payload
+  return the original result; the same key with different data is rejected.
+  An ambiguous outcome keeps the attempt pending for recovery.
+- **Replay before admission.** An already confirmed booking can be returned even
+  if bookings are subsequently disabled or the appointment time has passed.
+  Recovering a prior result is not admitting a new booking.
+- **Scope of the guarantee.** This is retry-safe coordination, not exactly-once
+  delivery or a distributed transaction between Actors. The limits above are
+  per-operation waits, not a universal end-to-end deadline for every route.
+
 ## Observability
 
 Every request logs one structured JSON line (`src/observability/logger.ts`); phone
