@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("@telnyx/edge-runtime", () => ({
   StatefulActor: class {
@@ -434,6 +434,16 @@ describe("getAvailability service", () => {
 // ---------------------------------------------------------------------------
 
 describe("GET /demo/availability (HTTP route)", () => {
+  // The route reads Date.now(); pin it to Monday 2026-10-19 08:00 local so the
+  // expected slots do not depend on the day the suite runs.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW_MON_08);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   describe("unauthorized — no KV/Actor access", () => {
     it("401 without bearer, Actor not called", async () => {
       const agendaIdFromName = vi.fn(() => ({

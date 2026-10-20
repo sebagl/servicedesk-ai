@@ -8,8 +8,11 @@ Total: ~8–10 min live demo, then ~7–10 min walkthrough.
 
 ## Live demo (8–10 min)
 
-1. **The problem (30 s).** A small repair shop misses calls while mechanics work; every
-   missed call is a missed booking.
+1. **Context and the problem (30 s).** Say up front that the trial account could not buy a
+   phone number (only Mexico local numbers, out of stock), so calls go through the Telnyx
+   web widget; the assistant and workflow are the same ones a number would reach. Then the
+   problem: a small repair shop misses calls while mechanics work; every missed call is a
+   missed booking.
 2. **Happy path call (3 min).** "I'd like an oil change on Thursday."
    - Disclosure (speak node) → intent → the assistant offers real open times.
    - Point at the logs: `webhook.dynamic_variables` (signed delivery, today's date,

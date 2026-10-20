@@ -127,8 +127,14 @@ invalid stored state fails closed instead of being treated as empty.
   live in Edge secrets and are never logged or returned. The two on the call path (MCP
   token, webhook public key) are cached per instance after a successful read.
 - Customer names and phone numbers are stored only inside Actors and returned only to
-  the authenticated portal; logs carry a masked phone (`***1234`) at most.
+  the authenticated portal; structured log fields carry a masked phone (`***1234`) at
+  most. Portal failure logs also include the error name and message, truncated to 160
+  characters, to make failures diagnosable; errors thrown by the Actors use fixed
+  messages, but platform errors (for example actor lookup failures) are logged as
+  received and can include internal identifiers.
 - Identifiers from requests are logged only if they match a safe character set.
-- The `/call` page is password-protected and the assistant id lives in Edge secrets: the
-  widget only needs that id, and every web call is billed to the account. Third-party
-  scripts on `/call` and `/portal` are pinned with Subresource Integrity.
+- The `/call` password protects the page, not the assistant. The assistant id is kept out
+  of the repo (Edge secrets), but after login it is delivered to the browser because the
+  widget needs it; anyone who obtains it could start web calls billed to the account.
+  Unauthenticated web calls should be disabled on the assistant when the evaluation ends.
+- Third-party scripts on `/call` and `/portal` are pinned with Subresource Integrity.

@@ -275,7 +275,9 @@ Found while building, with evidence in [docs/debugging.md](docs/debugging.md):
 ## Known limitations
 
 - Reached by web call through `/call`: the trial account had no purchasable phone number.
-  The page is password-protected and the assistant id is kept in Edge secrets, because any
-  web call is billed to the account.
+- The `/call` password protects the page, not the assistant: after login the widget
+  receives the assistant id in the browser, and anyone holding that id could start web
+  calls billed to the account. Unauthenticated web calls are meant to be disabled after
+  the evaluation.
 - No cancel/reschedule tool: changes go through a callback request.
 - Callback requests are stored and visible to staff; there is no automatic call-back.
